@@ -1,0 +1,71 @@
+set_zone_schedule:
+  name: Set Zone Schedule
+  description: Replace the schedule for a specific day in a zone.
+  fields:
+    zone_id:
+      name: Zone ID
+      description: Identifier of the heating zone.
+      required: true
+      example: "downstairs"
+      selector:
+        text:
+    day:
+      name: Day
+      description: Day of the week (mon, tue, wed, thu, fri, sat, sun).
+      required: true
+      example: "mon"
+      selector:
+        select:
+          options:
+            - mon
+            - tue
+            - wed
+            - thu
+            - fri
+            - sat
+            - sun
+    slots:
+      name: Slots
+      description: >
+        List of schedule slots. Each slot must have a time (HH:MM) and either
+        a temperature (number) or a preset (home/away/eco/sleep/boost).
+      required: true
+      example: '[{"time": "07:30", "temperature": 20.0}, {"time": "22:00", "preset": "sleep", "preemptable": true}]'
+      selector:
+        object:
+
+enable_zone:
+  name: Enable Zone
+  description: Enable scheduling for a zone.
+  fields:
+    zone_id:
+      name: Zone ID
+      description: Identifier of the heating zone.
+      required: true
+      example: "downstairs"
+      selector:
+        text:
+
+disable_zone:
+  name: Disable Zone
+  description: Disable scheduling for a zone (heating is not turned off, just no longer automatically controlled).
+  fields:
+    zone_id:
+      name: Zone ID
+      description: Identifier of the heating zone.
+      required: true
+      example: "downstairs"
+      selector:
+        text:
+
+skip_next_transition:
+  name: Skip Next Transition
+  description: Skip the next scheduled transition for a zone (useful for one-off manual overrides).
+  fields:
+    zone_id:
+      name: Zone ID
+      description: Identifier of the heating zone.
+      required: true
+      example: "downstairs"
+      selector:
+        text:

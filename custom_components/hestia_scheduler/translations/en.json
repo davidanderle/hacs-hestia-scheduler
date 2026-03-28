@@ -1,0 +1,63 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Hestia Scheduler - First Zone",
+        "description": "Configure your first heating zone. Add more zones via the integration Options after setup.",
+        "data": {
+          "zone_id": "Zone ID (e.g. downstairs)",
+          "name": "Zone Name (e.g. Downstairs)",
+          "climate_entity": "Climate Entity (PID thermostat)",
+          "outside_temp_entity": "Outside Temperature Sensor (optional)",
+          "base_heat_rate": "Initial Heat-up Rate (°C/hr)"
+        }
+      }
+    },
+    "error": {
+      "invalid_zone_id": "Zone ID must not be empty",
+      "zone_id_exists": "A zone with this ID already exists"
+    },
+    "abort": {
+      "single_instance_allowed": "Only one Hestia Scheduler instance is allowed"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Manage Zones",
+        "description": "Active zones: {zones}",
+        "data": {
+          "action": "Action"
+        }
+      },
+      "add_zone": {
+        "title": "Add Zone",
+        "data": {
+          "zone_id": "Zone ID",
+          "name": "Zone Name",
+          "climate_entity": "Climate Entity",
+          "outside_temp_entity": "Outside Temperature Sensor (optional)",
+          "base_heat_rate": "Initial Heat-up Rate (°C/hr)"
+        }
+      },
+      "remove_zone": {
+        "title": "Remove Zone",
+        "data": {
+          "zone_id": "Zone to remove"
+        }
+      },
+      "edit_outside_temp": {
+        "title": "Edit Outside Temperature Sensor",
+        "data": {
+          "zone_id": "Zone",
+          "outside_temp_entity": "Outside Temperature Sensor"
+        }
+      }
+    },
+    "error": {
+      "invalid_zone_id": "Zone ID must not be empty",
+      "zone_id_exists": "A zone with this ID already exists",
+      "no_zones": "No zones configured yet"
+    }
+  }
+}
