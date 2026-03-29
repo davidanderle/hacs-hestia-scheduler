@@ -1,12 +1,12 @@
 {
   "domain": "hestia_scheduler",
   "name": "Hestia Scheduler",
-  "codeowners": ["@davidanderle"],
+  "codeowners": [],
   "config_flow": true,
   "dependencies": ["mqtt", "http", "websocket_api"],
-  "documentation": "https://github.com/davidanderle/hestia-scheduler",
+  "documentation": "https://github.com/your-repo/hestia-scheduler",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/davidanderle/hestia-scheduler/issues",
+  "issue_tracker": "https://github.com/your-repo/hestia-scheduler/issues",
   "requirements": [],
   "version": "1.0.0"
 }

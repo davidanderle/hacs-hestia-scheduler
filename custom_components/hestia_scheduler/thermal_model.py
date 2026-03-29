@@ -48,6 +48,10 @@ class ThermalModel:
     def __init__(self, hass: "HomeAssistant", store: "ScheduleStorage") -> None:
         self.hass = hass
         self.store = store
+        # Cache of observed preset→temperature mappings per zone, built up as
+        # presets are activated and the resulting target temperature is read back
+        # from the climate entity.  Keyed by (zone_id, preset_name).
+        self._preset_temp_cache: dict[tuple[str, str], float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -197,6 +201,95 @@ class ThermalModel:
             "Zone %s thermal model updated: rate %.3f→%.3f C/hr, loss %.4f→%.4f",
             zone_id, params.base_heat_rate, new_rate, params.loss_factor, new_loss,
         )
+
+    # ------------------------------------------------------------------
+    # Preset temperature resolution
+    # ------------------------------------------------------------------
+
+    def update_preset_cache(self, zone_id: str) -> None:
+        """Seed the runtime cache from stored preset_temperatures and live
+        climate entity state.  Call on startup and after schedule reloads."""
+        zone = self.store.async_get_zone(zone_id)
+        if zone is None:
+            return
+
+        # 1. Load persisted preset→temp mappings (learned from previous runs)
+        for preset_name, temp in zone.thermal.preset_temperatures.items():
+            self._preset_temp_cache[(zone_id, preset_name)] = temp
+
+        # 2. Try reading {preset}_temp attrs from the climate entity
+        state = self.hass.states.get(zone.climate_entity)
+        if state is not None:
+            attrs = state.attributes
+            for preset_name in ("home", "away", "eco", "sleep", "boost", "comfort"):
+                val = attrs.get(f"{preset_name}_temp")
+                if val is None:
+                    val = attrs.get(f"{preset_name}_temperature")
+                if val is not None:
+                    try:
+                        self._preset_temp_cache[(zone_id, preset_name)] = float(val)
+                    except (ValueError, TypeError):
+                        pass
+
+            # 3. Map currently active preset to its target temperature
+            preset = attrs.get("preset_mode")
+            target = attrs.get("temperature")
+            if preset and target is not None:
+                try:
+                    self._preset_temp_cache[(zone_id, preset)] = float(target)
+                except (ValueError, TypeError):
+                    pass
+
+        cached = self.get_preset_cache(zone_id)
+        if cached:
+            _LOGGER.debug("Zone %s: preset temp cache: %s", zone_id, cached)
+
+    def learn_preset_temp(self, zone_id: str) -> None:
+        """Read the climate entity's current preset/temperature and persist
+        the mapping so it survives restarts."""
+        zone = self.store.async_get_zone(zone_id)
+        if zone is None:
+            return
+        state = self.hass.states.get(zone.climate_entity)
+        if state is None:
+            return
+        preset = state.attributes.get("preset_mode")
+        target = state.attributes.get("temperature")
+        if not preset or target is None:
+            return
+        try:
+            temp = float(target)
+        except (ValueError, TypeError):
+            return
+
+        self._preset_temp_cache[(zone_id, preset)] = temp
+
+        # Persist to store if this is a new or changed mapping
+        stored = zone.thermal.preset_temperatures
+        if stored.get(preset) != temp:
+            updated = {**stored, preset: temp}
+            from .store import ZoneThermalParams
+            new_thermal = ZoneThermalParams(
+                base_heat_rate=zone.thermal.base_heat_rate,
+                loss_factor=zone.thermal.loss_factor,
+                ref_outside_temp=zone.thermal.ref_outside_temp,
+                outside_temp_entity=zone.thermal.outside_temp_entity,
+                history=list(zone.thermal.history),
+                preset_temperatures=updated,
+            )
+            self.store.async_update_thermal_params(zone_id, new_thermal)
+            _LOGGER.info(
+                "Zone %s: learned preset '%s' = %.1f°C (persisted)",
+                zone_id, preset, temp,
+            )
+
+    def resolve_preset_temp(self, zone_id: str, preset: str) -> float | None:
+        """Return the target temperature for a preset, or None if unknown."""
+        return self._preset_temp_cache.get((zone_id, preset))
+
+    def get_preset_cache(self, zone_id: str) -> dict[str, float]:
+        """Return all known preset→temp mappings for a zone."""
+        return {k[1]: v for k, v in self._preset_temp_cache.items() if k[0] == zone_id}
 
     # ------------------------------------------------------------------
     # Internal helpers

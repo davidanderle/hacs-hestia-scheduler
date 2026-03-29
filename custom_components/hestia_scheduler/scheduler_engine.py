@@ -32,7 +32,10 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_point_in_time,
+    async_track_state_change_event,
 )
+
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
     DOMAIN,
@@ -41,6 +44,7 @@ from .const import (
     PREHEAT_REEVAL_INTERVAL,
     DEFAULT_MIN_LEAD_MINUTES,
     EVENT_TRANSITION_EXECUTED,
+    EVENT_PREHEAT_UPDATE,
     EVENT_STARTED,
 )
 
@@ -154,6 +158,7 @@ class ZoneTimer:
         self._preheat_timer_cancel = None
         self._reeval_timer_cancel = None
         self._preempt_notify_cancel = None
+        self._temp_track_cancel = None
         self._preempt_task: asyncio.Task | None = None
         self._skip_next: bool = False
         self._user_responded: bool = False
@@ -180,6 +185,9 @@ class ZoneTimer:
         if zone is None or not zone.enabled:
             return
 
+        # Seed the preset→temperature cache from the current climate entity state
+        self.thermal.update_preset_cache(self.zone_id)
+
         now = dt_util.utcnow()
         active_slot, _ = find_active_slot(zone, now)
 
@@ -190,6 +198,7 @@ class ZoneTimer:
             await self._async_apply_slot(active_slot, is_recovery=False)
 
         await self._async_schedule_next()
+        self._subscribe_temp_changes()
 
     async def async_stop(self) -> None:
         """Cancel all timers for this zone."""
@@ -285,7 +294,15 @@ class ZoneTimer:
         lead_minutes = self._calc_lead_minutes(next_slot)
         preheat_dt = next_dt - timedelta(minutes=lead_minutes) if lead_minutes > 0 else None
 
-        if preheat_dt is not None and preheat_dt > now + timedelta(seconds=30):
+        if preheat_dt is not None and preheat_dt <= now + timedelta(seconds=30):
+            # Pre-heat window already passed — start immediately
+            _LOGGER.info(
+                "Zone %s: pre-heat window already open (%d min lead, preheat_dt=%s), starting now",
+                self.zone_id, lead_minutes, preheat_dt.isoformat(),
+            )
+            await self._async_start_preheat(next_slot, next_dt)
+
+        elif preheat_dt is not None:
             @callback
             def _on_preheat(_now):
                 self.hass.async_create_task(self._async_start_preheat(next_slot, next_dt))
@@ -357,6 +374,8 @@ class ZoneTimer:
             self.hass, _on_transition, next_dt
         )
 
+        async_dispatcher_send(self.hass, EVENT_PREHEAT_UPDATE, self.zone_id)
+
     async def _async_reeval_preheat(
         self, next_slot: "ScheduleSlot", next_dt: datetime
     ) -> None:
@@ -412,27 +431,30 @@ class ZoneTimer:
 
         current_temp = self.thermal.get_current_temp(self.zone_id)
         outside_temp = self.thermal.get_outside_temp(self.zone_id)
+        target_temp = self._resolve_target_temp(next_slot)
 
         # Store context for later heat event recording
         self._preheat_start_temp = current_temp
         self._preheat_start_time = dt_util.utcnow()
         self._preheat_outside_temp = outside_temp
-        self._preheat_target_temp = next_slot.temperature
+        self._preheat_target_temp = target_temp
 
         zone = self.store.async_get_zone(self.zone_id)
         if zone is None:
             return
 
         _LOGGER.info(
-            "Zone %s: starting pre-heat for %s slot at %s (current=%.1f, target=%s)",
+            "Zone %s: starting pre-heat for %s slot at %s (current=%s, target=%s, preset=%s)",
             self.zone_id,
             next_slot.time,
             next_dt.isoformat(),
-            current_temp if current_temp is not None else -99,
-            next_slot.temperature,
+            f"{current_temp:.1f}" if current_temp is not None else "unknown",
+            f"{target_temp:.1f}" if target_temp is not None else "unknown",
+            next_slot.preset,
         )
 
         await self._async_call_climate(zone.climate_entity, next_slot)
+        async_dispatcher_send(self.hass, EVENT_PREHEAT_UPDATE, self.zone_id)
 
     # ------------------------------------------------------------------
     # Preemption notification (fires preempt_lead_minutes before transition)
@@ -583,6 +605,14 @@ class ZoneTimer:
         )
         await self._async_call_climate(zone.climate_entity, slot)
 
+        # After applying a preset, give HA a moment to update the entity state,
+        # then learn and persist the preset→temperature mapping.
+        if slot.preset is not None:
+            async def _learn_preset():
+                await asyncio.sleep(2)
+                self.thermal.learn_preset_temp(self.zone_id)
+            self.hass.async_create_task(_learn_preset())
+
     async def _async_call_climate(
         self, entity_id: str, slot: "ScheduleSlot"
     ) -> None:
@@ -623,27 +653,37 @@ class ZoneTimer:
             "Zone %s: rolling back to temp=%s preset=%s",
             self.zone_id, temperature, preset,
         )
-        from .store import ScheduleSlot
-
         if preset is not None:
-            rollback_slot = ScheduleSlot(time="00:00", preset=preset)
+            await self.hass.services.async_call(
+                CLIMATE_DOMAIN,
+                SERVICE_SET_PRESET_MODE,
+                {"entity_id": zone.climate_entity, ATTR_PRESET_MODE: preset},
+            )
         elif temperature is not None:
-            rollback_slot = ScheduleSlot(time="00:00", temperature=temperature)
+            await self.hass.services.async_call(
+                CLIMATE_DOMAIN,
+                SERVICE_SET_TEMPERATURE,
+                {"entity_id": zone.climate_entity, ATTR_TEMPERATURE: temperature},
+            )
         else:
             _LOGGER.warning("Zone %s: rollback has no target, skipping", self.zone_id)
-            return
-        await self._async_call_climate(zone.climate_entity, rollback_slot)
 
     # ------------------------------------------------------------------
     # Lead time calculation
     # ------------------------------------------------------------------
 
+    def _resolve_target_temp(self, slot: "ScheduleSlot") -> float | None:
+        """Return the target temperature for a slot, resolving presets via cache."""
+        if slot.temperature is not None:
+            return slot.temperature
+        if slot.preset is not None:
+            return self.thermal.resolve_preset_temp(self.zone_id, slot.preset)
+        return None
+
     def _calc_lead_minutes(self, slot: "ScheduleSlot") -> int:
         """Return pre-heat lead minutes for a slot (0 if no heating needed)."""
-        if slot.temperature is None:
-            # Preset-only slots: we don't know the target temp without looking up the
-            # preset map.  For now return a small default so the PID has some lead time.
-            # A future improvement would resolve the preset to its temperature.
+        target = self._resolve_target_temp(slot)
+        if target is None:
             return DEFAULT_MIN_LEAD_MINUTES
 
         current = self.thermal.get_current_temp(self.zone_id)
@@ -652,8 +692,64 @@ class ZoneTimer:
 
         outside = self.thermal.get_outside_temp(self.zone_id)
         return self.thermal.estimate_lead_minutes(
-            self.zone_id, current, slot.temperature, outside
+            self.zone_id, current, target, outside
         )
+
+    # ------------------------------------------------------------------
+    # Temperature-driven pre-heat re-evaluation
+    # ------------------------------------------------------------------
+
+    def _subscribe_temp_changes(self) -> None:
+        """Subscribe to state changes on the climate and outside temp entities
+        so pre-heat lead time is recalculated whenever temperatures update."""
+        self._cancel_temp_tracking()
+
+        zone = self.store.async_get_zone(self.zone_id)
+        if zone is None or not zone.enabled:
+            return
+
+        entities = [zone.climate_entity]
+        if zone.thermal.outside_temp_entity:
+            entities.append(zone.thermal.outside_temp_entity)
+
+        self._temp_track_cancel = async_track_state_change_event(
+            self.hass, entities, self._on_temp_state_change
+        )
+
+    @callback
+    def _on_temp_state_change(self, event) -> None:
+        """Re-evaluate pre-heat when a tracked temperature entity updates."""
+        if self.preheating or self.next_slot is None or self.next_transition_dt is None:
+            return
+
+        now = dt_util.utcnow()
+        if now >= self.next_transition_dt:
+            return
+
+        lead_minutes = self._calc_lead_minutes(self.next_slot)
+        if lead_minutes <= 0:
+            return
+
+        preheat_dt = self.next_transition_dt - timedelta(minutes=lead_minutes)
+        if preheat_dt <= now:
+            _LOGGER.info(
+                "Zone %s: temp change triggered pre-heat re-eval → lead %d min, starting now",
+                self.zone_id, lead_minutes,
+            )
+            self._cancel_preheat_timer()
+            self._cancel_reeval_timer()
+            self.hass.async_create_task(
+                self._async_start_preheat(self.next_slot, self.next_transition_dt)
+            )
+        elif self._preheat_timer_cancel is not None:
+            # Timer already set; only adjust if the new preheat_dt is significantly
+            # earlier (> 60s difference avoids constant timer churn).
+            pass
+
+    def _cancel_temp_tracking(self) -> None:
+        if self._temp_track_cancel:
+            self._temp_track_cancel()
+            self._temp_track_cancel = None
 
     # ------------------------------------------------------------------
     # Timer management
@@ -687,6 +783,7 @@ class ZoneTimer:
         self._cancel_preheat_timer()
         self._cancel_reeval_timer()
         self._cancel_preempt_timer()
+        self._cancel_temp_tracking()
 
 
 # ---------------------------------------------------------------------------

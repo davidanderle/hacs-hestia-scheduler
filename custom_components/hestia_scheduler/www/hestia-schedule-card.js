@@ -90,8 +90,20 @@ function activePresetNow(zone) {
 class HestiaScheduleDayRow extends HTMLElement {
   set day(d) { this._day = d; this._render(); }
   set zone(z) { this._zone = z; this._render(); }
-  set isToday(v) { this._isToday = v; this._render(); }
+  set isToday(v) { this._isToday = v; this._render(); this._startNowTimer(); }
   set disabled(v) { this._disabled = v; this._render(); }
+  set preheat(p) {
+    const key = p ? `${p.active}|${p.startMinutes}|${p.nextSlotMinutes}|${p.isLive}` : "";
+    if (key === this._preheatKey) return;
+    this._preheatKey = key;
+    this._preheat = p;
+    this._render();
+  }
+  set heatingOn(v) {
+    if (v === this._heatingOn) return;
+    this._heatingOn = v;
+    this._render();
+  }
 
   connectedCallback() {
     this.addEventListener("click", () => {
@@ -104,6 +116,23 @@ class HestiaScheduleDayRow extends HTMLElement {
     this.addEventListener("mouseleave", () => {
       this.style.background = "";
     });
+  }
+
+  disconnectedCallback() { this._stopNowTimer(); }
+
+  _startNowTimer() {
+    this._stopNowTimer();
+    if (!this._isToday) return;
+    this._nowTimer = setInterval(() => {
+      const el = this.querySelector(".now-needle");
+      if (!el) return;
+      const now = new Date();
+      el.style.left = ((now.getHours()*60 + now.getMinutes()) / TOTAL_MINS * 100).toFixed(2) + "%";
+    }, 60000);
+  }
+
+  _stopNowTimer() {
+    if (this._nowTimer) { clearInterval(this._nowTimer); this._nowTimer = null; }
   }
 
   _render() {
@@ -136,17 +165,35 @@ class HestiaScheduleDayRow extends HTMLElement {
     this.style.cssText = `display:flex;align-items:center;gap:${ROW_GAP}px;cursor:pointer;border-radius:6px;padding:1px 0;transition:background .12s;`;
     this.title = "Click to edit";
 
+    const sepHtml = segs.length > 1
+      ? segs.slice(1).map(s =>
+          `<div style="position:absolute;top:0;width:1px;height:100%;left:${s.leftPct.toFixed(3)}%;background:rgba(0,0,0,0.2);z-index:4;pointer-events:none;"></div>`
+        ).join("")
+      : "";
+
+    let preheatHtml = "";
+    const ph = this._preheat;
+    if (ph && ph.active && ph.startMinutes < ph.nextSlotMinutes) {
+      const gradLeft = (ph.startMinutes / TOTAL_MINS * 100).toFixed(3);
+      const gradWidth = ((ph.nextSlotMinutes - ph.startMinutes) / TOTAL_MINS * 100).toFixed(3);
+      const gradOpacity = ph.isLive ? 0.92 : 0.45;
+      preheatHtml = `<div style="position:absolute;top:0;height:100%;left:${gradLeft}%;width:${gradWidth}%;background:linear-gradient(to right, ${ph.currentSlotColor}, ${ph.nextSlotColor});z-index:3;pointer-events:none;opacity:${gradOpacity};"></div>`;
+    }
+
     let timeIndicator = "";
     if (this._isToday) {
       const now = new Date();
       const nowPct = ((now.getHours() * 60 + now.getMinutes()) / TOTAL_MINS * 100).toFixed(2);
-      timeIndicator = `<div style="position:absolute;top:-1px;bottom:-1px;left:${nowPct}%;width:2px;background:var(--primary-color,#03a9f4);z-index:2;border-radius:1px;box-shadow:0 0 3px var(--primary-color,#03a9f4);"></div>`;
+      const fireIcon = this._heatingOn
+        ? `<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);line-height:0;filter:drop-shadow(0 0 2px rgba(0,0,0,.8)) drop-shadow(0 0 4px rgba(0,0,0,.4));"><ha-icon icon="mdi:fire" style="--mdc-icon-size:16px;color:var(--error-color,#ef5350);"></ha-icon></div>`
+        : "";
+      timeIndicator = `<div class="now-needle" style="position:absolute;top:-1px;bottom:-1px;left:${nowPct}%;width:2px;background:var(--primary-color,#03a9f4);z-index:6;border-radius:1px;box-shadow:0 0 3px var(--primary-color,#03a9f4);overflow:visible;">${fireIcon}</div>`;
     }
 
     this.innerHTML = `
       <span style="width:${LABEL_W}px;font-size:.82em;flex-shrink:0;${todayColor}">${label}</span>
       <div style="width:${MARKER_W}px;height:26px;border-radius:2px;background:var(--primary-color,#03a9f4);flex-shrink:0;visibility:${this._isToday?"visible":"hidden"};"></div>
-      <div style="position:relative;height:26px;flex:1;min-width:0;background:var(--secondary-background-color,#333);border-radius:5px;overflow:hidden;opacity:${barOpacity};">${segHtml}${timeIndicator}</div>`;
+      <div class="tl" style="position:relative;height:26px;flex:1;min-width:0;background:var(--secondary-background-color,#333);border-radius:5px;overflow:hidden;opacity:${barOpacity};">${segHtml}${sepHtml}${preheatHtml}${timeIndicator}</div>`;
   }
 }
 customElements.define("hestia-day-row", HestiaScheduleDayRow);
@@ -355,6 +402,7 @@ class HestiaScheduleCard extends HTMLElement {
     const first = !this._hass;
     this._hass = hass;
     if (first) this._loadZones();
+    else if (this._zones) this._refreshTodayRow();
   }
 
   connectedCallback() { this._subscribe(); }
@@ -416,16 +464,15 @@ class HestiaScheduleCard extends HTMLElement {
       return `<button data-zone="${z.zone_id}" style="display:inline-flex;align-items:center;gap:4px;padding:5px 12px;border:none;${activeStyle}${opacity}cursor:pointer;font-size:.92em;white-space:nowrap;transition:background .15s,color .15s;">${curPresetIcon} ${z.name} ${disabledBadge} ${tempStr}</button>`;
     }).join("");
 
-    const tickHours = [0, 3, 6, 9, 12, 15, 18, 21, 24];
-    const tickHtml = tickHours.map(h => {
+    const tickHtml = Array.from({length: 25}, (_, h) => {
       const pct = (h / 24 * 100).toFixed(2);
-      return `<span style="position:absolute;left:${pct}%;transform:translateX(-50%);font-size:.62em;color:var(--secondary-text-color);user-select:none;">${h}</span>`;
+      return `<span style="position:absolute;left:${pct}%;transform:translateX(-50%);font-size:.58em;color:var(--secondary-text-color);user-select:none;bottom:1px;">${h}</span>`;
     }).join("");
     const axisRow = `
       <div style="display:flex;align-items:flex-end;gap:${ROW_GAP}px;padding:1px 0;">
         <span style="width:${LABEL_W}px;flex-shrink:0;"></span>
         <div style="width:${MARKER_W}px;flex-shrink:0;"></div>
-        <div style="flex:1;min-width:0;position:relative;height:14px;">${tickHtml}</div>
+        <div style="flex:1;min-width:0;position:relative;height:16px;">${tickHtml}</div>
       </div>`;
 
     const rowsHtml = WEEKDAYS.map(day =>
@@ -445,21 +492,100 @@ class HestiaScheduleCard extends HTMLElement {
           <div style="padding:12px 16px 0;font-size:1.1em;font-weight:600;">Heating Schedule</div>
           <div style="display:flex;gap:4px;padding:8px 16px 6px;overflow-x:auto;scrollbar-width:none;">${tabsHtml}</div>
           <div style="padding:2px 16px 0;">${axisRow}</div>
-          <div style="display:flex;flex-direction:column;gap:1px;padding:2px 16px 10px;">${rowsHtml}</div>
+          <div id="week-grid" style="display:flex;flex-direction:column;gap:1px;padding:2px 16px 10px;position:relative;">
+            ${rowsHtml}
+            <div id="hover-cursor" style="position:absolute;top:2px;bottom:10px;width:1px;background:rgba(255,255,255,0.4);pointer-events:none;z-index:20;display:none;">
+              <div id="hover-label" style="position:absolute;top:2px;left:50%;transform:translateX(-50%);font-size:.6em;color:rgba(255,255,255,0.9);background:rgba(0,0,0,0.7);padding:1px 5px;border-radius:3px;white-space:nowrap;"></div>
+            </div>
+          </div>
           <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:0 16px 12px;">${disabledLabel}${enableBtn}</div>
         </ha-card>
         <hestia-schedule-editor id="editor"></hestia-schedule-editor>`;
 
     if (zone) {
+      const climateState = this._hass?.states?.[zone.climate_entity];
+      const heating = climateState?.attributes?.hvac_action === "heating";
       this.querySelectorAll("hestia-day-row").forEach(el => {
         el.zone = zone;
         el.day = el.dataset.day;
         el.isToday = el.dataset.today === "true";
         el.disabled = !zone.enabled;
+        el.preheat = this._buildPreheatInfo(zone, el.dataset.day);
+        if (el.dataset.today === "true") el.heatingOn = heating;
       });
     }
 
     this._bindEvents();
+  }
+
+  _refreshTodayRow() {
+    const zones = this._zones ?? [];
+    const zone = zones.find(z => z.zone_id === this._activeZoneId) ?? zones[0];
+    if (!zone) return;
+    const today = todayWeekday();
+    const row = this.querySelector(`hestia-day-row[data-day="${today}"]`);
+    if (!row) return;
+    row.preheat = this._buildPreheatInfo(zone, today);
+    const climateState = this._hass?.states?.[zone.climate_entity];
+    row.heatingOn = climateState?.attributes?.hvac_action === "heating";
+  }
+
+  _findPreheatState(zoneId) {
+    if (!this._hass) return null;
+    for (const [eid, s] of Object.entries(this._hass.states)) {
+      if (eid.startsWith("sensor.") && eid.includes(zoneId) && eid.endsWith("_pre_heat")
+          && s.attributes.preset_temp_cache !== undefined) {
+        return s;
+      }
+    }
+    return null;
+  }
+
+  _buildPreheatInfo(zone, day) {
+    const storageKey = `hestia_ph_${zone.zone_id}_${day}`;
+    const today = todayWeekday();
+
+    if (day === today) {
+      const s = this._findPreheatState(zone.zone_id);
+      if (s && s.attributes.preheating === true) {
+        const nextSlotTime = s.attributes.next_slot_time;
+        const preheatStartLocal = s.attributes.preheat_start_local;
+        if (nextSlotTime && preheatStartLocal) {
+          const nextSlotMins = timeToMinutes(nextSlotTime);
+          let startMins;
+          try { const d = new Date(preheatStartLocal); startMins = d.getHours() * 60 + d.getMinutes(); } catch {}
+          if (startMins !== undefined) {
+            const slots = zone.days[day] ?? [];
+            const sorted = [...slots].sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time));
+            let curSlot = sorted[0], nxtSlot = sorted[0];
+            for (let i = 0; i < sorted.length; i++) {
+              if (timeToMinutes(sorted[i].time) <= startMins) curSlot = sorted[i];
+              if (timeToMinutes(sorted[i].time) === nextSlotMins) nxtSlot = sorted[i];
+            }
+            const info = {
+              active: true, isLive: true,
+              startMinutes: startMins, nextSlotMinutes: nextSlotMins,
+              currentSlotColor: slotColor(curSlot), nextSlotColor: slotColor(nxtSlot),
+            };
+            try { localStorage.setItem(storageKey, JSON.stringify({
+              startMinutes: startMins, nextSlotMinutes: nextSlotMins,
+              currentSlotColor: info.currentSlotColor, nextSlotColor: info.nextSlotColor,
+            })); } catch {}
+            return info;
+          }
+        }
+      }
+    }
+
+    try {
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        const d = JSON.parse(saved);
+        return { active: true, isLive: false, startMinutes: d.startMinutes, nextSlotMinutes: d.nextSlotMinutes,
+          currentSlotColor: d.currentSlotColor, nextSlotColor: d.nextSlotColor };
+      }
+    } catch {}
+    return null;
   }
 
   _bindEvents() {
@@ -486,10 +612,32 @@ class HestiaScheduleCard extends HTMLElement {
       const { zone_id, days, slots } = e.detail;
       for (const day of days) {
         try {
+          localStorage.removeItem(`hestia_ph_${zone_id}_${day}`);
           await this._hass.callWS({ type: `${DOMAIN}/update_schedule`, zone_id, day, slots });
         } catch(err) { console.error("Save failed", err); }
       }
     });
+
+    const weekGrid = this.querySelector('#week-grid');
+    const cursor = this.querySelector('#hover-cursor');
+    const hoverLabel = this.querySelector('#hover-label');
+    if (weekGrid && cursor && hoverLabel) {
+      weekGrid.addEventListener('mousemove', e => {
+        const tl = weekGrid.querySelector('.tl');
+        if (!tl) return;
+        const tlRect = tl.getBoundingClientRect();
+        const gridRect = weekGrid.getBoundingClientRect();
+        const x = e.clientX - tlRect.left;
+        if (x < 0 || x > tlRect.width) { cursor.style.display = 'none'; return; }
+        const mins = Math.round(x / tlRect.width * TOTAL_MINS);
+        const h = Math.floor(mins / 60);
+        const m = mins % 60;
+        cursor.style.display = 'block';
+        cursor.style.left = (tlRect.left - gridRect.left + x) + 'px';
+        hoverLabel.textContent = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+      });
+      weekGrid.addEventListener('mouseleave', () => { cursor.style.display = 'none'; });
+    }
   }
 
   static getStubConfig() { return { type: "custom:hestia-schedule-card" }; }

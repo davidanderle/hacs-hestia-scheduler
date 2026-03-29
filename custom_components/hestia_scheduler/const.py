@@ -57,6 +57,7 @@ EVENT_ZONE_UPDATED = "hestia_scheduler_zone_updated"
 EVENT_ZONE_REMOVED = "hestia_scheduler_zone_removed"
 EVENT_SCHEDULE_UPDATED = "hestia_scheduler_schedule_updated"
 EVENT_TRANSITION_EXECUTED = "hestia_scheduler_transition_executed"
+EVENT_PREHEAT_UPDATE = "hestia_scheduler_preheat_update"
 EVENT_STARTED = "hestia_scheduler_started"
 
 # -------------------------------------------------------------------
@@ -127,6 +128,9 @@ ATTR_REF_OUTSIDE_TEMP = "ref_outside_temp"
 ATTR_HEAT_HISTORY = "history"
 ATTR_SHUTDOWN_TIME = "shutdown_time"
 ATTR_ZONES = "zones"
+
+# Preset temperature mapping (learned / user-configured)
+ATTR_PRESET_TEMPERATURES = "preset_temperatures"
 
 # Rollback state keys
 ATTR_ROLLBACK_AVAILABLE = "rollback_available"

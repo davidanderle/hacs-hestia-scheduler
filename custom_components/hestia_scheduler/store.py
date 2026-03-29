@@ -39,6 +39,7 @@ from .const import (
     ATTR_LOSS_FACTOR,
     ATTR_REF_OUTSIDE_TEMP,
     ATTR_HEAT_HISTORY,
+    ATTR_PRESET_TEMPERATURES,
     ATTR_SHUTDOWN_TIME,
     ATTR_ZONES,
     DEFAULT_PREEMPT_LEAD_MINUTES,
@@ -114,6 +115,7 @@ class ZoneThermalParams:
     ref_outside_temp: float = DEFAULT_REF_OUTSIDE_TEMP
     outside_temp_entity: str | None = None
     history: list[HeatUpEvent] = field(default_factory=list)
+    preset_temperatures: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -122,6 +124,7 @@ class ZoneThermalParams:
             ATTR_REF_OUTSIDE_TEMP: self.ref_outside_temp,
             ATTR_OUTSIDE_TEMP_ENTITY: self.outside_temp_entity,
             ATTR_HEAT_HISTORY: [e.to_dict() for e in self.history],
+            ATTR_PRESET_TEMPERATURES: self.preset_temperatures,
         }
 
     @classmethod
@@ -133,6 +136,7 @@ class ZoneThermalParams:
             ref_outside_temp=data.get(ATTR_REF_OUTSIDE_TEMP, DEFAULT_REF_OUTSIDE_TEMP),
             outside_temp_entity=data.get(ATTR_OUTSIDE_TEMP_ENTITY),
             history=history,
+            preset_temperatures=data.get(ATTR_PRESET_TEMPERATURES, {}),
         )
 
 
