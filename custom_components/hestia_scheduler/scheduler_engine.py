@@ -283,7 +283,7 @@ class ZoneTimer:
             _LOGGER.warning("Zone %s: no next slot found, scheduler idle", self.zone_id)
             return
 
-        _LOGGER.warning(
+        _LOGGER.info(
             "Zone %s: next transition at %s (slot=%s, preemptable=%s, preempt_lead=%d min, now=%s)",
             self.zone_id, next_dt.isoformat(), next_slot.time,
             next_slot.preemptable, next_slot.preempt_lead_minutes,
