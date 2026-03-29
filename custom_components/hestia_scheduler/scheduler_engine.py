@@ -327,7 +327,7 @@ class ZoneTimer:
         # Preemption: send notification preempt_lead_minutes BEFORE the transition
         if next_slot.preemptable:
             preempt_dt = next_dt - timedelta(minutes=next_slot.preempt_lead_minutes)
-            _LOGGER.warning(
+            _LOGGER.info(
                 "Zone %s: preempt_dt=%s, now=%s, preempt_dt>now=%s, now<next_dt=%s",
                 self.zone_id, preempt_dt.isoformat(), now.isoformat(),
                 preempt_dt > now, now < next_dt,
@@ -335,7 +335,7 @@ class ZoneTimer:
             if preempt_dt > now:
                 @callback
                 def _on_preempt(_now):
-                    _LOGGER.warning(
+                    _LOGGER.info(
                         "Zone %s: preempt timer FIRED at %s",
                         self.zone_id, dt_util.utcnow().isoformat(),
                     )
@@ -345,13 +345,13 @@ class ZoneTimer:
                 self._preempt_notify_cancel = async_track_point_in_time(
                     self.hass, _on_preempt, preempt_dt
                 )
-                _LOGGER.warning(
+                _LOGGER.info(
                     "Zone %s: preempt timer SET for %s (%d min before transition at %s)",
                     self.zone_id, preempt_dt.isoformat(),
                     next_slot.preempt_lead_minutes, next_dt.isoformat(),
                 )
             elif now < next_dt:
-                _LOGGER.warning(
+                _LOGGER.info(
                     "Zone %s: within preempt window, sending IMMEDIATE preempt notification",
                     self.zone_id,
                 )
@@ -359,7 +359,7 @@ class ZoneTimer:
                     self._async_preempt_notify(next_slot, next_dt)
                 )
             else:
-                _LOGGER.warning(
+                _LOGGER.info(
                     "Zone %s: preempt window missed (preempt_dt=%s <= now=%s >= next_dt=%s)",
                     self.zone_id, preempt_dt.isoformat(), now.isoformat(),
                     next_dt.isoformat(),
@@ -465,7 +465,7 @@ class ZoneTimer:
     ) -> None:
         """Send preemption notification and wait for response until transition time."""
         now = dt_util.utcnow()
-        _LOGGER.warning(
+        _LOGGER.info(
             "Zone %s: _async_preempt_notify ENTERED at %s (transition at %s)",
             self.zone_id, now.isoformat(), slot_dt.isoformat(),
         )
@@ -480,7 +480,7 @@ class ZoneTimer:
 
         remaining_secs = max(1, int((slot_dt - now).total_seconds()))
 
-        _LOGGER.warning(
+        _LOGGER.info(
             "Zone %s: publishing preempt MQTT now (%d sec before transition to %s)",
             self.zone_id, remaining_secs,
             slot.preset or f"{slot.temperature}°C",
@@ -499,12 +499,12 @@ class ZoneTimer:
         self._user_responded = user_responded
         if not should_proceed:
             self._skip_next = True
-            _LOGGER.warning(
+            _LOGGER.info(
                 "Zone %s: user chose to skip transition to %s",
                 self.zone_id, slot.preset or f"{slot.temperature}°C",
             )
         elif user_responded:
-            _LOGGER.warning(
+            _LOGGER.info(
                 "Zone %s: user explicitly approved transition (no rollback)",
                 self.zone_id,
             )
@@ -517,7 +517,7 @@ class ZoneTimer:
         self, slot: "ScheduleSlot", slot_dt: datetime
     ) -> None:
         """Handle a scheduled transition time arriving."""
-        _LOGGER.warning(
+        _LOGGER.info(
             "Zone %s: _async_on_transition ENTERED at %s (slot_dt=%s, skip_next=%s, preempt_task_done=%s)",
             self.zone_id, dt_util.utcnow().isoformat(), slot_dt.isoformat(),
             self._skip_next,
@@ -540,7 +540,7 @@ class ZoneTimer:
         # Check if preemption response said to skip
         if slot.preemptable and self._skip_next:
             self._skip_next = False
-            _LOGGER.warning("Zone %s: transition skipped by preemption response", self.zone_id)
+            _LOGGER.info("Zone %s: transition skipped by preemption response", self.zone_id)
             await self._async_schedule_next()
             return
 
@@ -649,7 +649,7 @@ class ZoneTimer:
         zone = self.store.async_get_zone(self.zone_id)
         if zone is None:
             return
-        _LOGGER.warning(
+        _LOGGER.info(
             "Zone %s: rolling back to temp=%s preset=%s",
             self.zone_id, temperature, preset,
         )
