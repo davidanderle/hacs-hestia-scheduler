@@ -81,8 +81,6 @@ DEFAULT_MIN_LEAD_MINUTES = 5         # never pre-heat less than 5 minutes early
 DEFAULT_MAX_LEAD_MINUTES = 240       # cap at 4 hours
 THERMAL_EMA_ALPHA = 0.15             # learning rate for EMA updates
 MAX_HEAT_HISTORY = 50                # heat events to keep per zone
-PREHEAT_REEVAL_INTERVAL = 1800       # seconds between lead-time re-evaluations (30 min)
-
 # -------------------------------------------------------------------
 # Preemption defaults
 # -------------------------------------------------------------------

@@ -7,7 +7,7 @@ For each zone, a ZoneTimer:
 4. Handles preemptable slots (notify, wait for response)
 5. Executes climate service calls
 6. Records heat-up events for learning
-7. Re-evaluates pre-heat lead time every PREHEAT_REEVAL_INTERVAL seconds
+7. Re-evaluates pre-heat lead time when room or outside temperatures change
 
 Restart recovery:
 - On HA start, compares the slot that was active at shutdown with the one
@@ -30,7 +30,6 @@ from homeassistant.components.climate import (
 from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import (
-    async_call_later,
     async_track_point_in_time,
     async_track_state_change_event,
 )
@@ -41,7 +40,6 @@ from .const import (
     DOMAIN,
     PYTHON_WEEKDAY_MAP,
     WEEKDAYS,
-    PREHEAT_REEVAL_INTERVAL,
     DEFAULT_MIN_LEAD_MINUTES,
     EVENT_TRANSITION_EXECUTED,
     EVENT_PREHEAT_UPDATE,
@@ -156,7 +154,6 @@ class ZoneTimer:
 
         self._main_timer_cancel = None
         self._preheat_timer_cancel = None
-        self._reeval_timer_cancel = None
         self._preempt_notify_cancel = None
         self._temp_track_cancel = None
         self._preempt_task: asyncio.Task | None = None
@@ -266,7 +263,6 @@ class ZoneTimer:
         """Calculate and arm the timer for the next transition."""
         self._cancel_main_timer()
         self._cancel_preheat_timer()
-        self._cancel_reeval_timer()
         self._cancel_preempt_timer()
         self._skip_next = False
         self._user_responded = False
@@ -295,7 +291,6 @@ class ZoneTimer:
         preheat_dt = next_dt - timedelta(minutes=lead_minutes) if lead_minutes > 0 else None
 
         if preheat_dt is not None and preheat_dt <= now + timedelta(seconds=30):
-            # Pre-heat window already passed — start immediately
             _LOGGER.info(
                 "Zone %s: pre-heat window already open (%d min lead, preheat_dt=%s), starting now",
                 self.zone_id, lead_minutes, preheat_dt.isoformat(),
@@ -314,15 +309,6 @@ class ZoneTimer:
                 "Zone %s: pre-heat timer set for %s (%d min lead)",
                 self.zone_id, preheat_dt.isoformat(), lead_minutes,
             )
-
-            reeval_delay = PREHEAT_REEVAL_INTERVAL
-            if (preheat_dt - now).total_seconds() > PREHEAT_REEVAL_INTERVAL:
-                @callback
-                def _on_reeval(_now):
-                    self.hass.async_create_task(self._async_reeval_preheat(next_slot, next_dt))
-                self._reeval_timer_cancel = async_call_later(
-                    self.hass, reeval_delay, _on_reeval
-                )
 
         # Preemption: send notification preempt_lead_minutes BEFORE the transition
         if next_slot.preemptable:
@@ -375,48 +361,6 @@ class ZoneTimer:
         )
 
         async_dispatcher_send(self.hass, EVENT_PREHEAT_UPDATE, self.zone_id)
-
-    async def _async_reeval_preheat(
-        self, next_slot: "ScheduleSlot", next_dt: datetime
-    ) -> None:
-        """Re-evaluate the pre-heat lead time and adjust timer if needed."""
-        self._cancel_preheat_timer()
-        self._cancel_reeval_timer()
-
-        zone = self.store.async_get_zone(self.zone_id)
-        if zone is None or not zone.enabled:
-            return
-
-        now = dt_util.utcnow()
-        if now >= next_dt:
-            return  # too late, main transition timer will handle it
-
-        lead_minutes = self._calc_lead_minutes(next_slot)
-        preheat_dt = next_dt - timedelta(minutes=lead_minutes)
-
-        if preheat_dt <= now:
-            # We're already in the pre-heat window; start now
-            _LOGGER.info(
-                "Zone %s: re-eval moved pre-heat start to now (lead %d min)",
-                self.zone_id, lead_minutes,
-            )
-            await self._async_start_preheat(next_slot, next_dt)
-        else:
-            @callback
-            def _on_preheat(_now):
-                self.hass.async_create_task(self._async_start_preheat(next_slot, next_dt))
-            self._preheat_timer_cancel = async_track_point_in_time(
-                self.hass, _on_preheat, preheat_dt
-            )
-            # Re-arm next re-eval
-            remaining = (preheat_dt - now).total_seconds()
-            if remaining > PREHEAT_REEVAL_INTERVAL:
-                @callback
-                def _on_reeval2(_now):
-                    self.hass.async_create_task(self._async_reeval_preheat(next_slot, next_dt))
-                self._reeval_timer_cancel = async_call_later(
-                    self.hass, PREHEAT_REEVAL_INTERVAL, _on_reeval2
-                )
 
     # ------------------------------------------------------------------
     # Pre-heat start
@@ -737,7 +681,6 @@ class ZoneTimer:
                 self.zone_id, lead_minutes,
             )
             self._cancel_preheat_timer()
-            self._cancel_reeval_timer()
             self.hass.async_create_task(
                 self._async_start_preheat(self.next_slot, self.next_transition_dt)
             )
@@ -765,11 +708,6 @@ class ZoneTimer:
             self._preheat_timer_cancel()
             self._preheat_timer_cancel = None
 
-    def _cancel_reeval_timer(self) -> None:
-        if self._reeval_timer_cancel:
-            self._reeval_timer_cancel()
-            self._reeval_timer_cancel = None
-
     def _cancel_preempt_timer(self) -> None:
         if self._preempt_notify_cancel:
             self._preempt_notify_cancel()
@@ -781,7 +719,6 @@ class ZoneTimer:
     def _cancel_all_timers(self) -> None:
         self._cancel_main_timer()
         self._cancel_preheat_timer()
-        self._cancel_reeval_timer()
         self._cancel_preempt_timer()
         self._cancel_temp_tracking()
 
