@@ -302,8 +302,3 @@ The integration creates one sensor entity per zone, visible under **Settings →
 ## License
 
 MIT
-
-## TODO:
-1. Fix schedule rollback feature
-2. Add option to log the learning thermostat's parameters
-3. Ensure that the learning thermostat works as intended
