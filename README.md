@@ -1,8 +1,12 @@
+# Disclaimer: 
+**The entire repo was vibe-coded in 6 hours with Cursor following strict instructions. However, I did not read or modify a single line of code. It works for me, but use with caution!**
+
 # Hestia Scheduler
 
-A custom Home Assistant integration providing a Nest-style heating schedule with a learning thermostat, preemption notifications, and a beautiful Lovelace card — designed for multi-zone underfloor and thermaskirt heating systems.
+A custom Home Assistant integration providing a Nest-style heating schedule with a learning thermostat, preemption notifications, and a beautiful Lovelace card — designed for multi-zone heating systems. **Note that a schedule start time t means that by time t the temperature should reach T degrees set by the new schedule. So setting 20C for 7:30am on a weekday means that by 7:30am your zone will be heated up to 20C**. This is done through a learning algorithm that adapts the start time of your heatup phase based on the delta between the internal and external temperatures, and your home's heat loss estimate.  
 
 ![Hestia Scheduler Card](assets/screenshot.png)
+![Hestia Scheduler Card](assets/screenshot2.png)
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 ![HA Version](https://img.shields.io/badge/HA-2024.1%2B-blue)
@@ -30,7 +34,7 @@ This integration is designed for a split Home Assistant setup:
 - **Kobold** (HA Green, main instance): Receives MQTT events via a Mosquitto bridge, sends mobile notifications via `notify.mobile_app`, and relays user responses back to Hestia.
 
 ```
-Hestia (RPi 5)                           Kobold (HA Green)
+Heating HA instance                      Primary HA instance
 ┌─────────────────────┐   MQTT bridge   ┌──────────────────────┐
 │  Scheduler Engine   │ ─────────────── │  Preempt Automation  │
 │  Thermal Model      │ ────preempt───► │  ──► notify.all_phones│
@@ -126,6 +130,7 @@ Restart Mosquitto after editing.
 
 ```yaml
 alias: "Hestia Schedule: Preemption Notification"
+description: ""
 triggers:
   - trigger: mqtt
     options:
@@ -139,22 +144,24 @@ actions:
       next_temp: "{{ data.next_temp | default(none) }}"
       scheduled_time: "{{ data.scheduled_time }}"
       deadline: "{{ data.deadline_seconds | int(60) }}"
-      action_skip: "HESTIA_PREEMPT_SKIP_{{ context.id }}"
+      action_skip: HESTIA_PREEMPT_SKIP_{{ context.id }}
+      action_proceed: HESTIA_PREEMPT_PROCEED_{{ context.id }}
       target_label: >-
-        {% if next_preset %}{{ next_preset }}{% else %}{{ next_temp }}°C{% endif %}
+        {% if next_preset %}{{ next_preset }}{% else %}{{ next_temp }}°C{% endif
+        %}
   - action: notify.all_phones
     data:
-      title: "🏠 {{ zone | title }}: schedule change at {{ scheduled_time }}"
+      title: 🌡️ {{ zone | title }} schedule change
       message: >-
-        Switching from {{ current_preset }} to {{ target_label }}.
-        Respond within {{ (deadline | int / 60) | round(0) | int }} min or it proceeds automatically.
+        Switching to {{ target_label }} at {{ scheduled_time }}. Cancel or it
+        proceeds automatically.
       data:
-        tag: "hestia_preempt_{{ zone }}"
+        tag: hestia_preempt_{{ zone }}
         ttl: 0
         priority: high
         actions:
           - action: "{{ action_skip }}"
-            title: "Cancel"
+            title: Cancel
   - wait_for_trigger:
       - trigger: event
         event_type: mobile_app_notification_action
@@ -163,7 +170,7 @@ actions:
       - trigger: event
         event_type: mobile_app_notification_cleared
         event_data:
-          tag: "hestia_preempt_{{ zone }}"
+          tag: hestia_preempt_{{ zone }}
     timeout:
       seconds: "{{ deadline | int }}"
     continue_on_timeout: true
@@ -173,11 +180,12 @@ actions:
     then:
       - variables:
           response: >-
-            {% if wait.trigger.event.event_type == 'mobile_app_notification_action' %}skip{% else %}proceed{% endif %}
+            {% if wait.trigger.event.event_type ==
+            'mobile_app_notification_action' %}skip{% else %}proceed{% endif %}
       - action: mqtt.publish
         data:
-          topic: "hestia/scheduler/{{ zone }}/preempt/response"
-          payload: '{"action": "{{ response }}"}'
+          topic: hestia/scheduler/{{ zone }}/preempt/response
+          payload: "{\"action\": \"{{ response }}\"}"
 mode: parallel
 max: 4
 ```
@@ -186,6 +194,7 @@ max: 4
 
 ```yaml
 alias: "Hestia Schedule: Rollback Notification"
+description: ""
 triggers:
   - trigger: mqtt
     options:
@@ -193,26 +202,28 @@ triggers:
 conditions:
   - condition: template
     value_template: >-
-      {% set d = trigger.payload | from_json %}
-      {{ d.rollback_available | default(false) and not d.user_responded | default(true) }}
+      {% set d = trigger.payload | from_json %} {{ d.rollback_available |
+      default(false) and not d.user_responded | default(true) }}
 actions:
   - variables:
       data: "{{ trigger.payload | from_json }}"
       zone: "{{ data.zone }}"
       new_preset: "{{ data.new_preset | default('unknown') }}"
       prev_preset: "{{ data.previous_preset | default('unknown') }}"
-      action_restore: "HESTIA_ROLLBACK_{{ context.id }}"
+      action_restore: HESTIA_ROLLBACK_{{ context.id }}
   - action: notify.all_phones
     data:
-      title: "🏠 {{ zone | title }}: switched to {{ new_preset }}"
-      message: "Was {{ prev_preset }}. Tap below to revert."
+      title: 🌡️ {{ zone | title }} schedule change
+      message: >-
+        From '{{ prev_preset }}' switched to `{{ new_preset }}'. Tap restore to
+        undo.
       data:
-        tag: "hestia_rollback_{{ zone }}"
+        tag: hestia_rollback_{{ zone }}
         ttl: 0
         priority: high
         actions:
           - action: "{{ action_restore }}"
-            title: "Restore {{ prev_preset }}"
+            title: Restore {{ prev_preset }}
   - wait_for_trigger:
       - trigger: event
         event_type: mobile_app_notification_action
@@ -226,13 +237,13 @@ actions:
     then:
       - action: mqtt.publish
         data:
-          topic: "hestia/scheduler/{{ zone }}/rollback"
-          payload: '{"action": "restore_previous"}'
+          topic: hestia/scheduler/{{ zone }}/rollback
+          payload: "{\"action\": \"restore_previous\"}"
       - action: notify.all_phones
         data:
           message: "{{ zone | title }} schedule restored to {{ prev_preset }}."
           data:
-            tag: "hestia_rollback_{{ zone }}"
+            tag: hestia_rollback_{{ zone }}
 mode: parallel
 max: 4
 ```
@@ -291,3 +302,8 @@ The integration creates one sensor entity per zone, visible under **Settings →
 ## License
 
 MIT
+
+## TODO:
+1. Fix schedule rollback feature
+2. Add option to log the learning thermostat's parameters
+3. Ensure that the learning thermostat works as intended
