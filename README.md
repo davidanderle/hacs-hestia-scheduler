@@ -524,6 +524,11 @@ The integration creates two sensor entities per zone, visible under **Settings â
 
 ---
 
+## TODO
+Highlight on the schedule UI element if the time slot has been reverted back to the previous schedule by the user
+Fix pre-heat turns on too early
+Fix pre-heat UI gradient not showing if the UI is closed during pre-heat
+
 ## License
 
 MIT
