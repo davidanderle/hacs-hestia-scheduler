@@ -512,6 +512,7 @@ class ZoneTimer:
 
         # Apply the slot action
         await self._async_apply_slot(slot, is_recovery=False)
+        async_dispatcher_send(self.hass, EVENT_TRANSITION_EXECUTED, self.zone_id)
 
         # Publish transition event (for rollback notifications if preemptable)
         if slot.preemptable:
@@ -663,7 +664,11 @@ class ZoneTimer:
     @callback
     def _on_temp_state_change(self, event) -> None:
         """Re-evaluate pre-heat when a tracked temperature entity updates."""
-        if self.preheating or self.next_slot is None or self.next_transition_dt is None:
+        if self.preheating:
+            self._check_target_reached()
+            return
+
+        if self.next_slot is None or self.next_transition_dt is None:
             return
 
         now = dt_util.utcnow()
@@ -688,6 +693,39 @@ class ZoneTimer:
             # Timer already set; only adjust if the new preheat_dt is significantly
             # earlier (> 60s difference avoids constant timer churn).
             pass
+
+    def _check_target_reached(self) -> None:
+        """During pre-heating, check if the room reached the target temp.
+
+        Records the heat event with the actual heating time instead of
+        waiting until the transition fires, which would inflate the
+        recorded duration and train the rate too low.
+        """
+        if self._preheat_start_time is None or self._preheat_target_temp is None:
+            return
+        if self._preheat_start_temp is None:
+            return
+
+        current = self.thermal.get_current_temp(self.zone_id)
+        if current is None or current < self._preheat_target_temp:
+            return
+
+        now = dt_util.utcnow()
+        minutes = (now - self._preheat_start_time).total_seconds() / 60.0
+        self.thermal.record_heat_event(
+            zone_id=self.zone_id,
+            start_temp=self._preheat_start_temp,
+            target_temp=self._preheat_target_temp,
+            outside_temp=self._preheat_outside_temp,
+            minutes_to_reach=minutes,
+        )
+        _LOGGER.info(
+            "Zone %s: target %.1f°C reached during pre-heat in %d min (start=%.1f°C), event recorded",
+            self.zone_id, self._preheat_target_temp, int(minutes),
+            self._preheat_start_temp,
+        )
+        self._preheat_start_time = None
+        self._preheat_target_temp = None
 
     def _cancel_temp_tracking(self) -> None:
         if self._temp_track_cancel:

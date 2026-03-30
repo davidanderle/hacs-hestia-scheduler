@@ -166,6 +166,8 @@ class HestiaPreHeatSensor(SensorEntity):
         self._zone_name = zone_name
         self._attr_unique_id = f"{DOMAIN}_{zone_id}_preheat"
         self._attr_name = f"{zone_name} pre-heat"
+        self._last_preheat_started_at: str | None = None
+        self._last_preheat_next_slot_time: str | None = None
 
     @property
     def device_info(self):
@@ -327,11 +329,19 @@ class HestiaPreHeatSensor(SensorEntity):
 
         attrs["preheating"] = preheating
         if preheating and timer._preheat_start_time is not None:
-            attrs["preheat_started_at"] = dt_util.as_local(
+            started_at_local = dt_util.as_local(
                 timer._preheat_start_time
             ).isoformat()
+            attrs["preheat_started_at"] = started_at_local
             attrs["preheat_target_temp"] = timer._preheat_target_temp
             attrs["preheat_start_room_temp"] = timer._preheat_start_temp
+            if next_slot is not None:
+                self._last_preheat_started_at = started_at_local
+                self._last_preheat_next_slot_time = next_slot.time
+
+        if self._last_preheat_started_at is not None:
+            attrs["last_preheat_started_at"] = self._last_preheat_started_at
+            attrs["last_preheat_next_slot_time"] = self._last_preheat_next_slot_time
 
         attrs["preset_temp_cache"] = thermal.get_preset_cache(self._zone_id)
 

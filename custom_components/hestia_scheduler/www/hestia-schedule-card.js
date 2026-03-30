@@ -541,38 +541,53 @@ class HestiaScheduleCard extends HTMLElement {
     return null;
   }
 
+  _buildPreheatGradient(zone, day, startTimeStr, nextSlotTime, isLive, storageKey) {
+    let startMins;
+    try { const d = new Date(startTimeStr); startMins = d.getHours() * 60 + d.getMinutes(); } catch {}
+    if (startMins === undefined) return null;
+
+    const nextSlotMins = timeToMinutes(nextSlotTime);
+    const slots = zone.days[day] ?? [];
+    const sorted = [...slots].sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time));
+    let curSlot = sorted[0], nxtSlot = sorted[0];
+    for (let i = 0; i < sorted.length; i++) {
+      if (timeToMinutes(sorted[i].time) <= startMins) curSlot = sorted[i];
+      if (timeToMinutes(sorted[i].time) === nextSlotMins) nxtSlot = sorted[i];
+    }
+    const info = {
+      active: true, isLive,
+      startMinutes: startMins, nextSlotMinutes: nextSlotMins,
+      currentSlotColor: slotColor(curSlot), nextSlotColor: slotColor(nxtSlot),
+    };
+    if (storageKey) {
+      try { localStorage.setItem(storageKey, JSON.stringify({
+        startMinutes: startMins, nextSlotMinutes: nextSlotMins,
+        currentSlotColor: info.currentSlotColor, nextSlotColor: info.nextSlotColor,
+      })); } catch {}
+    }
+    return info;
+  }
+
   _buildPreheatInfo(zone, day) {
     const storageKey = `hestia_ph_${zone.zone_id}_${day}`;
     const today = todayWeekday();
 
     if (day === today) {
       const s = this._findPreheatState(zone.zone_id);
-      if (s && s.attributes.preheating === true) {
-        const nextSlotTime = s.attributes.next_slot_time;
-        const preheatStartLocal = s.attributes.preheat_start_local;
-        if (nextSlotTime && preheatStartLocal) {
-          const nextSlotMins = timeToMinutes(nextSlotTime);
-          let startMins;
-          try { const d = new Date(preheatStartLocal); startMins = d.getHours() * 60 + d.getMinutes(); } catch {}
-          if (startMins !== undefined) {
-            const slots = zone.days[day] ?? [];
-            const sorted = [...slots].sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time));
-            let curSlot = sorted[0], nxtSlot = sorted[0];
-            for (let i = 0; i < sorted.length; i++) {
-              if (timeToMinutes(sorted[i].time) <= startMins) curSlot = sorted[i];
-              if (timeToMinutes(sorted[i].time) === nextSlotMins) nxtSlot = sorted[i];
-            }
-            const info = {
-              active: true, isLive: true,
-              startMinutes: startMins, nextSlotMinutes: nextSlotMins,
-              currentSlotColor: slotColor(curSlot), nextSlotColor: slotColor(nxtSlot),
-            };
-            try { localStorage.setItem(storageKey, JSON.stringify({
-              startMinutes: startMins, nextSlotMinutes: nextSlotMins,
-              currentSlotColor: info.currentSlotColor, nextSlotColor: info.nextSlotColor,
-            })); } catch {}
-            return info;
+      if (s) {
+        if (s.attributes.preheating === true) {
+          const nextSlotTime = s.attributes.next_slot_time;
+          const startTime = s.attributes.preheat_started_at;
+          if (nextSlotTime && startTime) {
+            return this._buildPreheatGradient(zone, day, startTime, nextSlotTime, true, storageKey);
           }
+        }
+
+        const lastStart = s.attributes.last_preheat_started_at;
+        const lastSlotTime = s.attributes.last_preheat_next_slot_time;
+        if (lastStart && lastSlotTime) {
+          const grad = this._buildPreheatGradient(zone, day, lastStart, lastSlotTime, false, storageKey);
+          if (grad) return grad;
         }
       }
     }
