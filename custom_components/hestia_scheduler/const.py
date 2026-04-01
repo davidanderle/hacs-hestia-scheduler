@@ -81,6 +81,9 @@ DEFAULT_MIN_LEAD_MINUTES = 5         # never pre-heat less than 5 minutes early
 DEFAULT_MAX_LEAD_MINUTES = 240       # cap at 4 hours
 THERMAL_EMA_ALPHA = 0.15             # learning rate for EMA updates
 MAX_HEAT_HISTORY = 50                # heat events to keep per zone
+PREHEAT_TARGET_TOLERANCE = 0.3       # °C — treat target as reached when within this
+                                     # of the setpoint; accounts for PID controller
+                                     # asymptotic approach / hysteresis
 # -------------------------------------------------------------------
 # Preemption defaults
 # -------------------------------------------------------------------
@@ -135,3 +138,7 @@ ATTR_ROLLBACK_AVAILABLE = "rollback_available"
 ATTR_ROLLBACK_EXPIRES = "rollback_expires"
 ATTR_PREVIOUS_TEMP = "previous_temp"
 ATTR_PREVIOUS_PRESET = "previous_preset"
+
+# Slot override tracking (skipped/rolled-back occurrences)
+# Key: "day:HH:MM", value: {"at": ISO timestamp, "restored_preset": str|None, "restored_temp": float|None}
+ATTR_SLOT_OVERRIDES = "slot_overrides"

@@ -42,6 +42,7 @@ from .const import (
     ATTR_PRESET_TEMPERATURES,
     ATTR_SHUTDOWN_TIME,
     ATTR_ZONES,
+    ATTR_SLOT_OVERRIDES,
     DEFAULT_PREEMPT_LEAD_MINUTES,
     MAX_HEAT_HISTORY,
 )
@@ -149,6 +150,9 @@ class ZoneConfig:
     enabled: bool = True
     days: dict[str, list[ScheduleSlot]] = field(default_factory=dict)
     thermal: ZoneThermalParams = field(default_factory=ZoneThermalParams)
+    # Tracks slots that were skipped or rolled back this week.
+    # Key: "day:HH:MM", value: {"at": ISO timestamp, "restored_preset": str|None, "restored_temp": float|None}
+    slot_overrides: dict[str, dict] = field(default_factory=dict)
 
     def __post_init__(self):
         # Ensure all weekdays are present
@@ -167,6 +171,7 @@ class ZoneConfig:
                 for day, slots in self.days.items()
             },
             ATTR_THERMAL: self.thermal.to_dict(),
+            ATTR_SLOT_OVERRIDES: self.slot_overrides,
         }
 
     @classmethod
@@ -182,6 +187,7 @@ class ZoneConfig:
             enabled=data.get(ATTR_ENABLED, True),
             days=days,
             thermal=thermal,
+            slot_overrides=data.get(ATTR_SLOT_OVERRIDES, {}),
         )
 
 
@@ -322,6 +328,33 @@ class ScheduleStorage:
             history=history,
         )
         self.async_update_thermal_params(zone_id, thermal)
+
+    # ------------------------------------------------------------------
+    # Slot override tracking (skipped / rolled-back occurrences)
+    # ------------------------------------------------------------------
+
+    @callback
+    def async_set_slot_override(self, zone_id: str, key: str, info: dict) -> None:
+        """Record that a slot was skipped or rolled back.
+
+        key  -- "day:HH:MM", e.g. "mon:08:30"
+        info -- {"at": ISO timestamp, "restored_preset": str|None, "restored_temp": float|None}
+        """
+        zone = self.zones.get(zone_id)
+        if zone is None:
+            return
+        zone.slot_overrides[key] = info
+        self.async_schedule_save()
+
+    @callback
+    def async_clear_slot_override(self, zone_id: str, key: str) -> None:
+        """Remove a slot override when the slot fires normally."""
+        zone = self.zones.get(zone_id)
+        if zone is None:
+            return
+        if key in zone.slot_overrides:
+            del zone.slot_overrides[key]
+            self.async_schedule_save()
 
     # ------------------------------------------------------------------
     # Shutdown timestamp (for restart recovery)

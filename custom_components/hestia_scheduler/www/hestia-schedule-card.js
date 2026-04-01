@@ -41,9 +41,9 @@ function lerp(v, lo, hi, oLo, oHi) {
 }
 function tempColor(temp) {
   const c = Math.max(5, Math.min(30, temp));
-  const hue = lerp(c, 5, 30, 240, 0);
-  const lig = Math.max(45, Math.min(55, lerp(c, 10, 22, 45, 55)));
-  return `hsl(${hue.toFixed(0)},75%,${lig.toFixed(0)}%)`;
+  const hue = lerp(c, 8, 25, 240, 0);
+  const lig = Math.max(40, Math.min(58, lerp(c, 8, 25, 40, 58)));
+  return `hsl(${hue.toFixed(0)},80%,${lig.toFixed(0)}%)`;
 }
 function resolveTemp(slot) {
   if (slot.temperature != null) return slot.temperature;
@@ -142,19 +142,37 @@ class HestiaScheduleDayRow extends HTMLElement {
     const label = WEEKDAY_LABELS[this._day];
     const barOpacity = this._disabled ? 0.3 : 1;
 
+    const overrides = this._zone?.slot_overrides ?? {};
     const segHtml = segs.length > 0
       ? segs.map((s, i) => {
           const color = slotColor(s.slot);
-          const icon = s.slot.preset ? presetIcon(s.slot.preset, 15, "#fff") : "";
-          const lbl = s.slot.preset
-            ? icon
-            : `<span style="font-size:.72em;font-weight:600;">${resolveTemp(s.slot).toFixed(1)}°C</span>`;
-          const bell = s.slot.preemptable
-            ? `<ha-icon icon="mdi:bell-alert" style="--mdc-icon-size:12px;color:#FFD54F;vertical-align:middle;margin-left:2px;"></ha-icon>` : "";
+          const overrideKey = `${this._day}:${s.slot.time}`;
+          const override = overrides[overrideKey];
+          let lbl, bell;
+          if (override) {
+            const restoredPreset = override.restored_preset;
+            const restoredTemp = override.restored_temp;
+            const overrideColor = "var(--error-color,#ef5350)";
+            if (restoredPreset) {
+              lbl = presetIcon(restoredPreset, 15, overrideColor);
+            } else if (restoredTemp != null) {
+              lbl = `<span style="font-size:.72em;font-weight:600;color:${overrideColor};">${Number(restoredTemp).toFixed(1)}°C</span>`;
+            } else {
+              lbl = `<ha-icon icon="mdi:undo" style="--mdc-icon-size:15px;color:${overrideColor};vertical-align:middle;"></ha-icon>`;
+            }
+            bell = "";
+          } else {
+            const icon = s.slot.preset ? presetIcon(s.slot.preset, 15, "#fff") : "";
+            lbl = s.slot.preset
+              ? icon
+              : `<span style="font-size:.72em;font-weight:600;">${resolveTemp(s.slot).toFixed(1)}°C</span>`;
+            bell = s.slot.preemptable
+              ? `<ha-icon icon="mdi:bell-alert" style="--mdc-icon-size:12px;color:#FFD54F;vertical-align:middle;margin-left:2px;"></ha-icon>` : "";
+          }
           const show = s.widthPct > 4;
           const divider = i > 0
             ? "border-left:2px solid var(--card-background-color, #1c1c1c);" : "";
-          return `<div style="position:absolute;top:0;height:100%;left:${s.leftPct.toFixed(3)}%;width:${s.widthPct.toFixed(3)}%;background:${color};display:flex;align-items:center;justify-content:center;overflow:hidden;box-sizing:border-box;${divider}">${show ? `<span style="color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.4);white-space:nowrap;display:inline-flex;align-items:center;">${lbl}${bell}</span>` : ""}</div>`;
+          return `<div style="position:absolute;top:0;height:100%;left:${s.leftPct.toFixed(3)}%;width:${s.widthPct.toFixed(3)}%;background:${color};display:flex;align-items:center;justify-content:center;overflow:hidden;box-sizing:border-box;${divider}">${show ? `<span style="color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.4);white-space:nowrap;display:inline-flex;align-items:center;position:relative;z-index:4;">${lbl}${bell}</span>` : ""}</div>`;
         }).join("")
       : `<div style="height:100%;display:flex;align-items:center;justify-content:center;font-size:.72em;color:var(--secondary-text-color);">Click to edit</div>`;
 
@@ -176,8 +194,9 @@ class HestiaScheduleDayRow extends HTMLElement {
     if (ph && ph.active && ph.startMinutes < ph.nextSlotMinutes) {
       const gradLeft = (ph.startMinutes / TOTAL_MINS * 100).toFixed(3);
       const gradWidth = ((ph.nextSlotMinutes - ph.startMinutes) / TOTAL_MINS * 100).toFixed(3);
-      const gradOpacity = ph.isLive ? 0.92 : 0.45;
-      preheatHtml = `<div style="position:absolute;top:0;height:100%;left:${gradLeft}%;width:${gradWidth}%;background:linear-gradient(to right, ${ph.currentSlotColor}, ${ph.nextSlotColor});z-index:3;pointer-events:none;opacity:${gradOpacity};"></div>`;
+      const gradOpacity = 1.0;
+      const fireLeft = (ph.startMinutes / TOTAL_MINS * 100).toFixed(3);
+      preheatHtml = `<div style="position:absolute;top:0;height:100%;left:${gradLeft}%;width:${gradWidth}%;background:linear-gradient(to right, ${ph.currentSlotColor}, ${ph.nextSlotColor});z-index:3;pointer-events:none;opacity:${gradOpacity};"></div><div style="position:absolute;bottom:0;left:${fireLeft}%;z-index:5;pointer-events:none;line-height:0;transform:translateX(-50%);filter:drop-shadow(0 0 1px rgba(0,0,0,.9));"><ha-icon icon="mdi:fire" style="--mdc-icon-size:10px;color:var(--error-color,#ef5350);"></ha-icon></div>`;
     }
 
     let timeIndicator = "";
@@ -541,7 +560,7 @@ class HestiaScheduleCard extends HTMLElement {
     return null;
   }
 
-  _buildPreheatGradient(zone, day, startTimeStr, nextSlotTime, isLive, storageKey) {
+  _buildPreheatGradient(zone, day, startTimeStr, nextSlotTime, isLive, storageKey, actualFromTemp, actualToTemp) {
     let startMins;
     try { const d = new Date(startTimeStr); startMins = d.getHours() * 60 + d.getMinutes(); } catch {}
     if (startMins === undefined) return null;
@@ -549,20 +568,37 @@ class HestiaScheduleCard extends HTMLElement {
     const nextSlotMins = timeToMinutes(nextSlotTime);
     const slots = zone.days[day] ?? [];
     const sorted = [...slots].sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time));
-    let curSlot = sorted[0], nxtSlot = sorted[0];
+    let curSlot = null, nxtSlot = null;
     for (let i = 0; i < sorted.length; i++) {
       if (timeToMinutes(sorted[i].time) <= startMins) curSlot = sorted[i];
       if (timeToMinutes(sorted[i].time) === nextSlotMins) nxtSlot = sorted[i];
     }
+    if (!curSlot) {
+      const dayIdx = WEEKDAYS.indexOf(day);
+      for (let back = 1; back <= 6; back++) {
+        const prevDay = WEEKDAYS[(dayIdx - back + 7) % 7];
+        const prevSlots = zone.days[prevDay] ?? [];
+        if (prevSlots.length) {
+          const prevSorted = [...prevSlots].sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time));
+          curSlot = prevSorted[prevSorted.length - 1];
+          break;
+        }
+      }
+    }
+    if (!curSlot) curSlot = sorted[0];
+    if (!nxtSlot) nxtSlot = sorted[0];
+    const fromColor = actualFromTemp != null ? tempColor(actualFromTemp) : slotColor(curSlot);
+    const toColor = actualToTemp != null ? tempColor(actualToTemp) : slotColor(nxtSlot);
     const info = {
       active: true, isLive,
       startMinutes: startMins, nextSlotMinutes: nextSlotMins,
-      currentSlotColor: slotColor(curSlot), nextSlotColor: slotColor(nxtSlot),
+      currentSlotColor: fromColor, nextSlotColor: toColor,
     };
     if (storageKey) {
       try { localStorage.setItem(storageKey, JSON.stringify({
         startMinutes: startMins, nextSlotMinutes: nextSlotMins,
         currentSlotColor: info.currentSlotColor, nextSlotColor: info.nextSlotColor,
+        savedAt: new Date().toISOString().slice(0, 10),
       })); } catch {}
     }
     return info;
@@ -579,14 +615,16 @@ class HestiaScheduleCard extends HTMLElement {
           const nextSlotTime = s.attributes.next_slot_time;
           const startTime = s.attributes.preheat_started_at;
           if (nextSlotTime && startTime) {
-            return this._buildPreheatGradient(zone, day, startTime, nextSlotTime, true, storageKey);
+            return this._buildPreheatGradient(zone, day, startTime, nextSlotTime, true, storageKey,
+              s.attributes.preheat_start_room_temp, s.attributes.preheat_target_temp);
           }
         }
 
         const lastStart = s.attributes.last_preheat_started_at;
         const lastSlotTime = s.attributes.last_preheat_next_slot_time;
         if (lastStart && lastSlotTime) {
-          const grad = this._buildPreheatGradient(zone, day, lastStart, lastSlotTime, false, storageKey);
+          const grad = this._buildPreheatGradient(zone, day, lastStart, lastSlotTime, false, storageKey,
+            s.attributes.last_preheat_start_room_temp, s.attributes.last_preheat_target_temp);
           if (grad) return grad;
         }
       }
@@ -596,6 +634,12 @@ class HestiaScheduleCard extends HTMLElement {
       const saved = localStorage.getItem(storageKey);
       if (saved) {
         const d = JSON.parse(saved);
+        if (d.savedAt) {
+          const age = (Date.now() - new Date(d.savedAt).getTime()) / 86400000;
+          if (age > 7) { localStorage.removeItem(storageKey); return null; }
+        } else {
+          localStorage.removeItem(storageKey); return null;
+        }
         return { active: true, isLive: false, startMinutes: d.startMinutes, nextSlotMinutes: d.nextSlotMinutes,
           currentSlotColor: d.currentSlotColor, nextSlotColor: d.nextSlotColor };
       }

@@ -23,6 +23,7 @@ from .const import (
     ATTR_DAYS,
     ATTR_THERMAL,
     ATTR_BASE_HEAT_RATE,
+    ATTR_SLOT_OVERRIDES,
     EVENT_ZONE_CREATED,
     EVENT_ZONE_UPDATED,
     EVENT_ZONE_REMOVED,
@@ -93,6 +94,7 @@ class HestiaSchedulerCoordinator(DataUpdateCoordinator):
         }
         for day in WEEKDAYS:
             result[ATTR_DAYS][day] = [s.to_dict() for s in zone.days.get(day, [])]
+        result[ATTR_SLOT_OVERRIDES] = zone.slot_overrides
         return result
 
     def _get_current_temp(self, zone: "ZoneConfig") -> float | None:

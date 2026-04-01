@@ -42,8 +42,10 @@ from .const import (
     WEEKDAYS,
     DEFAULT_MIN_LEAD_MINUTES,
     EVENT_TRANSITION_EXECUTED,
+    EVENT_SCHEDULE_UPDATED,
     EVENT_PREHEAT_UPDATE,
     EVENT_STARTED,
+    PREHEAT_TARGET_TOLERANCE,
 )
 
 if TYPE_CHECKING:
@@ -485,6 +487,12 @@ class ZoneTimer:
         if slot.preemptable and self._skip_next:
             self._skip_next = False
             _LOGGER.info("Zone %s: transition skipped by preemption response", self.zone_id)
+            key = self._override_key(slot_dt, slot.time)
+            self._record_slot_override(
+                key,
+                restored_preset=self.active_slot.preset if self.active_slot else prev_preset,
+                restored_temp=self.active_slot.temperature if self.active_slot else prev_temp,
+            )
             await self._async_schedule_next()
             return
 
@@ -493,25 +501,49 @@ class ZoneTimer:
             self._preempt_task.cancel()
             self._preempt_task = None
 
-        # Record heat-up event for learning
+        # Record heat-up event for learning.
+        # _check_target_reached is the preferred recording path (fires as soon
+        # as the room is within tolerance of the target, capturing only the
+        # active heating phase).  This fallback handles the case where the
+        # target was never reached — uses the actual achieved delta so we
+        # don't conflate plateau/idle time with heating time.
         if self._preheat_start_time is not None and self._preheat_target_temp is not None:
             now = dt_util.utcnow()
             minutes = (now - self._preheat_start_time).total_seconds() / 60.0
             current = self.thermal.get_current_temp(self.zone_id)
             if current is not None and self._preheat_start_temp is not None:
-                self.thermal.record_heat_event(
-                    zone_id=self.zone_id,
-                    start_temp=self._preheat_start_temp,
-                    target_temp=self._preheat_target_temp,
-                    outside_temp=self._preheat_outside_temp,
-                    minutes_to_reach=minutes,
-                )
+                actual_delta = current - self._preheat_start_temp
+                if actual_delta >= 0.1:
+                    self.thermal.record_heat_event(
+                        zone_id=self.zone_id,
+                        start_temp=self._preheat_start_temp,
+                        target_temp=current,
+                        outside_temp=self._preheat_outside_temp,
+                        minutes_to_reach=minutes,
+                    )
+                    _LOGGER.info(
+                        "Zone %s: transition fallback recorded heat event "
+                        "(start=%.1f, reached=%.1f, target=%.1f, %d min)",
+                        self.zone_id, self._preheat_start_temp,
+                        current, self._preheat_target_temp, int(minutes),
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Zone %s: skipping heat event — negligible delta "
+                        "(start=%.1f, current=%.1f, %.1f min elapsed)",
+                        self.zone_id, self._preheat_start_temp,
+                        current, minutes,
+                    )
             self._preheat_start_time = None
             self._preheat_target_temp = None
         self.preheating = False
 
         # Apply the slot action
         await self._async_apply_slot(slot, is_recovery=False)
+        # Clear any prior override for this slot (it fired normally this week)
+        self.store.async_clear_slot_override(
+            self.zone_id, self._override_key(slot_dt, slot.time)
+        )
         async_dispatcher_send(self.hass, EVENT_TRANSITION_EXECUTED, self.zone_id)
 
         # Publish transition event (for rollback notifications if preemptable)
@@ -612,6 +644,48 @@ class ZoneTimer:
             )
         else:
             _LOGGER.warning("Zone %s: rollback has no target, skipping", self.zone_id)
+            return
+
+        # Record an override for the slot that was just undone (active_slot at rollback
+        # time is the slot that fired and was rolled back from).
+        if self.active_slot is not None:
+            now = dt_util.utcnow()
+            key = self._override_key(now, self.active_slot.time)
+            self._record_slot_override(key, restored_preset=preset, restored_temp=temperature)
+
+    # ------------------------------------------------------------------
+    # Slot override helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _override_key(slot_dt: datetime, slot_time: str) -> str:
+        """Return the "day:HH:MM" key used to index slot_overrides."""
+        local = dt_util.as_local(slot_dt)
+        day = PYTHON_WEEKDAY_MAP[local.weekday()]
+        return f"{day}:{slot_time}"
+
+    def _record_slot_override(
+        self,
+        key: str,
+        restored_preset: "str | None",
+        restored_temp: "float | None",
+    ) -> None:
+        """Persist an override and push a schedule-updated event to the card."""
+        now = dt_util.utcnow()
+        self.store.async_set_slot_override(
+            self.zone_id,
+            key,
+            {
+                "at": now.isoformat(),
+                "restored_preset": restored_preset,
+                "restored_temp": restored_temp,
+            },
+        )
+        async_dispatcher_send(self.hass, EVENT_SCHEDULE_UPDATED, self.zone_id)
+        _LOGGER.info(
+            "Zone %s: recorded slot override for %s (restored_preset=%s, restored_temp=%s)",
+            self.zone_id, key, restored_preset, restored_temp,
+        )
 
     # ------------------------------------------------------------------
     # Lead time calculation
@@ -677,6 +751,7 @@ class ZoneTimer:
 
         lead_minutes = self._calc_lead_minutes(self.next_slot)
         if lead_minutes <= 0:
+            self._cancel_preheat_timer()
             return
 
         preheat_dt = self.next_transition_dt - timedelta(minutes=lead_minutes)
@@ -700,6 +775,10 @@ class ZoneTimer:
         Records the heat event with the actual heating time instead of
         waiting until the transition fires, which would inflate the
         recorded duration and train the rate too low.
+
+        Uses PREHEAT_TARGET_TOLERANCE (0.3°C) to account for PID controller
+        hysteresis — the thermostat asymptotically approaches the setpoint
+        and may never report current_temp >= target exactly.
         """
         if self._preheat_start_time is None or self._preheat_target_temp is None:
             return
@@ -707,7 +786,15 @@ class ZoneTimer:
             return
 
         current = self.thermal.get_current_temp(self.zone_id)
-        if current is None or current < self._preheat_target_temp:
+        if current is None:
+            return
+
+        threshold = self._preheat_target_temp - PREHEAT_TARGET_TOLERANCE
+        if current < threshold:
+            return
+
+        actual_delta = current - self._preheat_start_temp
+        if actual_delta < 0.1:
             return
 
         now = dt_util.utcnow()
@@ -715,14 +802,15 @@ class ZoneTimer:
         self.thermal.record_heat_event(
             zone_id=self.zone_id,
             start_temp=self._preheat_start_temp,
-            target_temp=self._preheat_target_temp,
+            target_temp=current,
             outside_temp=self._preheat_outside_temp,
             minutes_to_reach=minutes,
         )
         _LOGGER.info(
-            "Zone %s: target %.1f°C reached during pre-heat in %d min (start=%.1f°C), event recorded",
+            "Zone %s: target ~%.1f°C reached during pre-heat in %d min "
+            "(start=%.1f°C, current=%.1f°C, tolerance=%.1f°C), event recorded",
             self.zone_id, self._preheat_target_temp, int(minutes),
-            self._preheat_start_temp,
+            self._preheat_start_temp, current, PREHEAT_TARGET_TOLERANCE,
         )
         self._preheat_start_time = None
         self._preheat_target_temp = None

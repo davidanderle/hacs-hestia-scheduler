@@ -168,6 +168,8 @@ class HestiaPreHeatSensor(SensorEntity):
         self._attr_name = f"{zone_name} pre-heat"
         self._last_preheat_started_at: str | None = None
         self._last_preheat_next_slot_time: str | None = None
+        self._last_preheat_start_room_temp: float | None = None
+        self._last_preheat_target_temp: float | None = None
 
     @property
     def device_info(self):
@@ -305,6 +307,8 @@ class HestiaPreHeatSensor(SensorEntity):
             "current_room_temp": round(current_temp, 1) if current_temp is not None else None,
             "outside_temp": round(outside_temp, 1) if outside_temp is not None else None,
             "base_heat_rate_c_hr": params.base_heat_rate,
+            "loss_factor": params.loss_factor,
+            "ref_outside_temp": params.ref_outside_temp,
             "adjusted_heat_rate_c_hr": adjusted_rate,
         }
 
@@ -338,10 +342,14 @@ class HestiaPreHeatSensor(SensorEntity):
             if next_slot is not None:
                 self._last_preheat_started_at = started_at_local
                 self._last_preheat_next_slot_time = next_slot.time
+                self._last_preheat_start_room_temp = timer._preheat_start_temp
+                self._last_preheat_target_temp = timer._preheat_target_temp
 
         if self._last_preheat_started_at is not None:
             attrs["last_preheat_started_at"] = self._last_preheat_started_at
             attrs["last_preheat_next_slot_time"] = self._last_preheat_next_slot_time
+            attrs["last_preheat_start_room_temp"] = self._last_preheat_start_room_temp
+            attrs["last_preheat_target_temp"] = self._last_preheat_target_temp
 
         attrs["preset_temp_cache"] = thermal.get_preset_cache(self._zone_id)
 
