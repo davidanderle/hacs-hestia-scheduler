@@ -539,11 +539,6 @@ The integration creates two sensor entities per zone, visible under **Settings â
 
 ---
 
-## TODO
-
-- Highlight schedule UI slots that have been manually reverted by the user
-- Investigate whether the thermal model incorrectly records a heat event on cooldown (temperature dropping through the threshold in reverse)
-
 ## License
 
 MIT
