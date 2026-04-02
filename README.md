@@ -154,11 +154,11 @@ The card provides a visual weekly overview of your heating schedule, inspired by
   - A red **OFF** badge if the zone's schedule is disabled
 - **Day rows** — Each row represents one day of the week (Monday–Sunday). Today's row is highlighted with the day name in the accent colour and a **vertical blue marker** at the left edge.
 - **Time axis** — Hour markers (0–24) run along the top, aligned with the coloured bars below.
-- **Coloured segments** — Each segment represents a schedule slot. The colour is derived from the **target temperature** on a gradient scale:
-  - **Cool blues/teals** (≈9–15°C) — eco/away temperatures
-  - **Greens** (≈18–21°C) — home/sleep temperatures
-  - **Warm yellows/oranges** (≈22–25°C) — comfort/boost temperatures
-  - **Reds** (≈26°C+) — very high targets
+- **Coloured segments** — Each segment represents a schedule slot. The colour is derived from the **target temperature** on a continuous HSL gradient scale spanning 6–25°C (80% saturation, lightness 40–58%):
+  - **Deep blue** (6°C) → **teal/cyan** (≈10–12°C) — eco/away setpoints
+  - **Greens** (≈15–19°C) — sleep/home setpoints
+  - **Yellow-green → yellow** (≈20–22°C) — home/comfort setpoints
+  - **Orange → red** (≈23–25°C) — boost/high setpoints
 - **Preset icons** — Inside each segment, a small icon identifies the preset:
   - 🏠 `mdi:home` — Home
   - 👤→ `mdi:account-arrow-right` — Away
@@ -170,7 +170,7 @@ The card provides a visual weekly overview of your heating schedule, inspired by
 - **Bell icon** (🔔 `mdi:bell-alert`, gold) — Appears next to the preset icon on **preemptable** slots. This means the scheduler will send a notification to your phone *before* this transition fires, giving you the chance to cancel it. See [Preemptive Action](#preemptive-action-bell-icon) below.
 - **Current-time needle** — A vertical blue line on today's row shows the current time, updating every minute.
 - **Fire icon** (🔥 `mdi:fire`, red) — Appears on the current-time needle when the zone's climate entity reports `hvac_action: heating`, so you can see at a glance whether the heating is actively firing.
-- **Pre-heat gradient** — When the learning thermostat decides to start heating early, a **gradient overlay** appears on today's row blending from the current slot's colour into the next slot's colour. This visually shows the pre-heat window. A brighter/more opaque gradient means pre-heating is actively happening right now; a fainter gradient indicates a remembered/predicted pre-heat window from the thermal model.
+- **Pre-heat gradient** — When the learning thermostat decides to start heating early, a **gradient overlay** appears on today's row blending from the current slot's colour into the next slot's colour. This visually shows the pre-heat window. A small 🔥 fire icon anchored at the bottom marks the exact minute pre-heating began. The gradient and fire icon persist across page loads and reloads via `localStorage` (entries expire after 7 days). Slot preset icons remain visible above the gradient.
 - **Hover cursor** — Moving the mouse over the weekly grid shows a vertical cursor with a time label, making it easy to read exact times.
 
 ### Editing a schedule
@@ -248,9 +248,23 @@ lead_minutes  = (target_temp − current_temp) / adjusted_rate × 60
 - **`loss_factor`** — How much colder outside air reduces the effective heat-up rate (default: 0.03 per °C below reference).
 - **`ref_outside_temp`** — The reference outside temperature at which the base rate was calibrated (default: 10°C).
 
-After each heat-up cycle, the model updates `base_rate` and `loss_factor` via an exponential moving average (α = 0.15), gradually improving its predictions. All parameters are persisted in `.storage/hestia_scheduler.storage` and included in HA native backups.
+After each heat-up cycle, the model updates `base_rate` and `loss_factor` via an **adaptive exponential moving average**. The learning rate α starts high when history is short and converges to the steady-state value as more events accumulate:
 
-The pre-heat lead time is re-evaluated whenever the room or outside temperature changes (via HA state change events), so the system adapts in real time if conditions shift (e.g. a sudden cold snap or opening a window).
+```
+α = max(0.15,  1 / (n_events + 1))
+```
+
+This means:
+- 1st event: α = 0.50 — the first real observation carries 50% weight, overriding the initial guess quickly
+- 2nd event: α = 0.33
+- 5th event: α = 0.17
+- 7th+ event: α = 0.15 — steady-state, slow drift
+
+`loss_factor` is clamped to **[0.005, 0.1]** — the floor of 0.005 prevents it from reaching zero, which would completely disable the outside-temperature correction.
+
+The model records the heat event as soon as the room temperature is within **0.3°C** of the target (to account for PID controller hysteresis/asymptotic approach), using the actual temperature gained and elapsed time. All parameters are persisted in `.storage/hestia_scheduler.storage` and included in HA native backups.
+
+The pre-heat lead time is re-evaluated whenever the room or outside temperature changes (via HA state change events), so the system adapts in real time if conditions shift (e.g. a sudden cold snap or opening a window). If the re-evaluation finds the room already at (or above) target, any pending pre-heat timer is cancelled.
 
 ### Pre-heat on the card
 
@@ -510,6 +524,7 @@ The integration creates two sensor entities per zone, visible under **Settings �
 | `resolved_target_temp` | Target temperature for the next slot |
 | `temp_delta` | Difference between target and current temp |
 | `preset_temp_cache` | Learned preset → temperature mappings |
+| `loss_factor` | Current learned outside-temperature correction factor |
 
 ---
 
@@ -525,10 +540,11 @@ The integration creates two sensor entities per zone, visible under **Settings �
 ---
 
 ## TODO
-Highlight on the schedule UI element if the time slot has been reverted back to the previous schedule by the user
-Fix pre-heat turns on too early
-Fix pre-heat UI gradient not showing if the UI is closed during pre-heat
+
+- Highlight schedule UI slots that have been manually reverted by the user
+- Investigate whether the thermal model incorrectly records a heat event on cooldown (temperature dropping through the threshold in reverse)
 
 ## License
 
 MIT
+
