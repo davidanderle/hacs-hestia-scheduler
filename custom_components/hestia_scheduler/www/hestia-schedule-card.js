@@ -560,7 +560,7 @@ class HestiaScheduleCard extends HTMLElement {
     return null;
   }
 
-  _buildPreheatGradient(zone, day, startTimeStr, nextSlotTime, isLive, storageKey, actualFromTemp, actualToTemp) {
+  _buildPreheatGradient(zone, day, startTimeStr, nextSlotTime, isLive, storageKey) {
     let startMins;
     try { const d = new Date(startTimeStr); startMins = d.getHours() * 60 + d.getMinutes(); } catch {}
     if (startMins === undefined) return null;
@@ -587,8 +587,8 @@ class HestiaScheduleCard extends HTMLElement {
     }
     if (!curSlot) curSlot = sorted[0];
     if (!nxtSlot) nxtSlot = sorted[0];
-    const fromColor = actualFromTemp != null ? tempColor(actualFromTemp) : slotColor(curSlot);
-    const toColor = actualToTemp != null ? tempColor(actualToTemp) : slotColor(nxtSlot);
+    const fromColor = slotColor(curSlot);
+    const toColor = slotColor(nxtSlot);
     const info = {
       active: true, isLive,
       startMinutes: startMins, nextSlotMinutes: nextSlotMins,
@@ -615,16 +615,14 @@ class HestiaScheduleCard extends HTMLElement {
           const nextSlotTime = s.attributes.next_slot_time;
           const startTime = s.attributes.preheat_started_at;
           if (nextSlotTime && startTime) {
-            return this._buildPreheatGradient(zone, day, startTime, nextSlotTime, true, storageKey,
-              s.attributes.preheat_start_room_temp, s.attributes.preheat_target_temp);
+            return this._buildPreheatGradient(zone, day, startTime, nextSlotTime, true, storageKey);
           }
         }
 
         const lastStart = s.attributes.last_preheat_started_at;
         const lastSlotTime = s.attributes.last_preheat_next_slot_time;
         if (lastStart && lastSlotTime) {
-          const grad = this._buildPreheatGradient(zone, day, lastStart, lastSlotTime, false, storageKey,
-            s.attributes.last_preheat_start_room_temp, s.attributes.last_preheat_target_temp);
+          const grad = this._buildPreheatGradient(zone, day, lastStart, lastSlotTime, false, storageKey);
           if (grad) return grad;
         }
       }
