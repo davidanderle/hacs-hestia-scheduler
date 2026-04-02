@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 DOMAIN = "hestia_scheduler"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # -------------------------------------------------------------------
 # Storage
