@@ -158,6 +158,11 @@ class ThermalModel:
 
         observed_rate = (delta / minutes_to_reach) * 60.0  # convert to C/hr
 
+        # Adaptive alpha: weight early observations more heavily so the model
+        # converges faster when history is short (1 event/day typical).
+        n_events = len(params.history)
+        alpha = max(THERMAL_EMA_ALPHA, 1.0 / (n_events + 1))
+
         # Estimate what rate the model would have predicted at this outside temp
         effective_outside = outside_temp if outside_temp is not None else params.ref_outside_temp
 
@@ -167,8 +172,8 @@ class ThermalModel:
             outside_delta = params.ref_outside_temp - effective_outside
             if outside_delta != 0:
                 implied_loss = (1.0 - implied_adjustment) / outside_delta
-                new_loss = THERMAL_EMA_ALPHA * implied_loss + (1.0 - THERMAL_EMA_ALPHA) * params.loss_factor
-                new_loss = max(0.0, min(0.1, new_loss))  # clamp to reasonable range
+                new_loss = alpha * implied_loss + (1.0 - alpha) * params.loss_factor
+                new_loss = max(0.005, min(0.1, new_loss))  # clamp: never fully disable outside-temp correction
             else:
                 new_loss = params.loss_factor
         else:
@@ -184,7 +189,7 @@ class ThermalModel:
         else:
             normalised_rate = observed_rate
 
-        new_rate = THERMAL_EMA_ALPHA * normalised_rate + (1.0 - THERMAL_EMA_ALPHA) * params.base_heat_rate
+        new_rate = alpha * normalised_rate + (1.0 - alpha) * params.base_heat_rate
         new_rate = max(0.05, min(5.0, new_rate))  # clamp to physical range
 
         from .store import ZoneThermalParams
@@ -194,12 +199,15 @@ class ThermalModel:
             ref_outside_temp=params.ref_outside_temp,
             outside_temp_entity=params.outside_temp_entity,
             history=list(zone.thermal.history),
+            preset_temperatures=params.preset_temperatures,
         )
         self.store.async_update_thermal_params(zone_id, updated_thermal)
 
         _LOGGER.info(
-            "Zone %s thermal model updated: rate %.3f→%.3f C/hr, loss %.4f→%.4f",
+            "Zone %s thermal model updated: rate %.3f→%.3f C/hr, loss %.4f→%.4f "
+            "(alpha=%.2f, %d events)",
             zone_id, params.base_heat_rate, new_rate, params.loss_factor, new_loss,
+            alpha, n_events,
         )
 
     # ------------------------------------------------------------------
