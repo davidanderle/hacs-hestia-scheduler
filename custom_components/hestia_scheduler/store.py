@@ -326,6 +326,7 @@ class ScheduleStorage:
             ref_outside_temp=zone.thermal.ref_outside_temp,
             outside_temp_entity=zone.thermal.outside_temp_entity,
             history=history,
+            preset_temperatures=zone.thermal.preset_temperatures,
         )
         self.async_update_thermal_params(zone_id, thermal)
 
