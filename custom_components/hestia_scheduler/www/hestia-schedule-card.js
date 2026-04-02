@@ -40,9 +40,9 @@ function lerp(v, lo, hi, oLo, oHi) {
   return oLo + ((v - lo) / (hi - lo)) * (oHi - oLo);
 }
 function tempColor(temp) {
-  const c = Math.max(5, Math.min(30, temp));
-  const hue = lerp(c, 8, 25, 240, 0);
-  const lig = Math.max(40, Math.min(58, lerp(c, 8, 25, 40, 58)));
+  const c = Math.max(6, Math.min(25, temp));
+  const hue = lerp(c, 6, 25, 240, 0);
+  const lig = Math.max(40, Math.min(58, lerp(c, 6, 25, 40, 58)));
   return `hsl(${hue.toFixed(0)},80%,${lig.toFixed(0)}%)`;
 }
 function resolveTemp(slot) {
