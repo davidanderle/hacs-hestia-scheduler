@@ -251,7 +251,7 @@ class ScheduleStorage:
         return data
 
     async def async_delete(self) -> None:
-        _LOGGER.warning("Removing all Hestia Scheduler data!")
+        _LOGGER.info("Removing all Hestia Scheduler data")
         self.zones = OrderedDict()
         await self._store.async_remove()
 

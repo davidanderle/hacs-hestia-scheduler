@@ -278,7 +278,7 @@ class ZoneTimer:
         self.next_slot = next_slot
         self.next_transition_dt = next_dt
         if next_slot is None or next_dt is None:
-            _LOGGER.warning("Zone %s: no next slot found, scheduler idle", self.zone_id)
+            _LOGGER.info("Zone %s: no next slot found, scheduler idle", self.zone_id)
             return
 
         _LOGGER.info(
