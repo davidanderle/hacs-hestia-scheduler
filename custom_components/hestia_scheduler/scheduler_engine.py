@@ -699,8 +699,34 @@ class ZoneTimer:
             return self.thermal.resolve_preset_temp(self.zone_id, slot.preset)
         return None
 
+    def _climate_is_off(self) -> bool:
+        """True if the zone's climate entity has been switched off (HVAC mode)."""
+        zone = self.store.async_get_zone(self.zone_id)
+        if zone is None:
+            return False
+        state = self.hass.states.get(zone.climate_entity)
+        return state is not None and state.state == "off"
+
+    def _abort_preheat(self) -> None:
+        """Cancel the running pre-heat cycle without recording a heat event."""
+        _LOGGER.info(
+            "Zone %s: climate entity turned off during pre-heat, "
+            "aborting pre-heat and discarding learning data",
+            self.zone_id,
+        )
+        self._cancel_preheat_timer()
+        self._preheat_start_time = None
+        self._preheat_start_temp = None
+        self._preheat_outside_temp = None
+        self._preheat_target_temp = None
+        self.preheating = False
+        async_dispatcher_send(self.hass, EVENT_PREHEAT_UPDATE, self.zone_id)
+
     def _calc_lead_minutes(self, slot: "ScheduleSlot") -> int:
         """Return pre-heat lead minutes for a slot (0 if no heating needed)."""
+        if self._climate_is_off():
+            return 0
+
         target = self._resolve_target_temp(slot)
         if target is None:
             return DEFAULT_MIN_LEAD_MINUTES
@@ -739,6 +765,9 @@ class ZoneTimer:
     def _on_temp_state_change(self, event) -> None:
         """Re-evaluate pre-heat when a tracked temperature entity updates."""
         if self.preheating:
+            if self._climate_is_off():
+                self._abort_preheat()
+                return
             self._check_target_reached()
             return
 
