@@ -6,6 +6,8 @@ A custom Home Assistant integration providing a Nest-style heating schedule with
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 ![HA Version](https://img.shields.io/badge/HA-2024.1%2B-blue)
+[![hassfest](https://github.com/davidanderle/hacs-hestia-scheduler/actions/workflows/hassfest.yml/badge.svg)](https://github.com/davidanderle/hacs-hestia-scheduler/actions/workflows/hassfest.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
@@ -289,7 +291,7 @@ Morning alarm data from Server 2 (or directly from phone APIs) could easily feed
 ### Via HACS (recommended)
 
 1. In HACS, go to **Integrations** → menu (top right) → **Custom repositories**
-2. Add `https://github.com/davidanderle/hestia-scheduler` with category **Integration**
+2. Add `https://github.com/davidanderle/hacs-hestia-scheduler` with category **Integration**
 3. Install **Hestia Scheduler** and restart Home Assistant
 4. Go to **Settings → Integrations → Add Integration** and search for **Hestia Scheduler**
 
@@ -541,5 +543,5 @@ The integration creates two sensor entities per zone, visible under **Settings �
 
 ## License
 
-MIT
+MIT -- see [LICENSE](LICENSE).
 
