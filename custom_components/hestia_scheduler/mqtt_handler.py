@@ -39,6 +39,10 @@ class MqttHandler:
         self.hass = hass
         self.store = store
         self._subscriptions: list[Callable] = []
+        # Zones already subscribed.  async_setup() and SchedulerEngine both
+        # subscribe every zone, which registered each handler twice (every
+        # rollback ran once and then logged "no context available").
+        self._subscribed_zones: set[str] = set()
         # zone_id -> asyncio.Future resolved when preempt response arrives
         self._preempt_futures: dict[str, asyncio.Future] = {}
         # zone_id -> rollback context (expires, previous state)
@@ -67,6 +71,9 @@ class MqttHandler:
         await self._async_subscribe_zone(zone_id)
 
     async def _async_subscribe_zone(self, zone_id: str) -> None:
+        if zone_id in self._subscribed_zones:
+            return
+        self._subscribed_zones.add(zone_id)
         response_topic = MQTT_TOPIC_PREEMPT_RESPONSE.format(zone=zone_id)
         rollback_topic = MQTT_TOPIC_ROLLBACK.format(zone=zone_id)
 
@@ -123,6 +130,7 @@ class MqttHandler:
         for unsub in self._subscriptions:
             unsub()
         self._subscriptions.clear()
+        self._subscribed_zones.clear()
 
     # ------------------------------------------------------------------
     # Preemption flow
@@ -208,10 +216,11 @@ class MqttHandler:
 
         if rollback_available:
             now = dt_util.utcnow()
+            # Documented behaviour: until the next transition OR 6 hours,
+            # whichever comes first (was: next transition only, i.e. up to days).
+            expires = now + timedelta(hours=6)
             if next_slot_time is not None:
-                expires = next_slot_time
-            else:
-                expires = now + timedelta(hours=6)
+                expires = min(expires, next_slot_time)
 
             self._rollback_contexts[zone_id] = {
                 "previous_temp": previous_temp,

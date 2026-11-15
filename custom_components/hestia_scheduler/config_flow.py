@@ -122,7 +122,10 @@ class HestiaSchedulerOptionsFlow(config_entries.OptionsFlow):
     ) -> config_entries.FlowResult:
         """Show main options menu."""
         if not self._zones:
-            self._zones = list(self.config_entry.data.get(CONF_ZONES, []))
+            # Copy each zone dict: edit_outside_temp mutates them, and mutating
+            # the dicts held by entry.data in place made the "new" options
+            # compare equal to the old ones.
+            self._zones = [dict(z) for z in self.config_entry.data.get(CONF_ZONES, [])]
 
         if user_input is not None:
             self._action = user_input.get("action")

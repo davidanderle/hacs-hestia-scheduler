@@ -17,6 +17,7 @@ from .const import (
     EVENT_ZONE_UPDATED,
     EVENT_ZONE_REMOVED,
     EVENT_SCHEDULE_UPDATED,
+    EVENT_TRANSITION_EXECUTED,
     ATTR_ZONE_ID,
     ATTR_ZONE_NAME,
     ATTR_CLIMATE_ENTITY,
@@ -175,7 +176,15 @@ async def ws_subscribe(hass: HomeAssistant, connection, msg) -> None:
             )
         return _handler
 
-    for event in (EVENT_ZONE_CREATED, EVENT_ZONE_UPDATED, EVENT_ZONE_REMOVED, EVENT_SCHEDULE_UPDATED):
+    # EVENT_TRANSITION_EXECUTED: a normal transition clears that slot's
+    # override, which the card would otherwise keep showing in red.
+    for event in (
+        EVENT_ZONE_CREATED,
+        EVENT_ZONE_UPDATED,
+        EVENT_ZONE_REMOVED,
+        EVENT_SCHEDULE_UPDATED,
+        EVENT_TRANSITION_EXECUTED,
+    ):
         listeners.append(
             async_dispatcher_connect(hass, event, _make_handler(event))
         )

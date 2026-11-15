@@ -74,13 +74,24 @@ function buildSegments(slots) {
 function activePresetNow(zone) {
   const day = todayWeekday();
   const slots = zone.days?.[day] ?? [];
-  if (!slots.length) return null;
+  if (!WEEKDAYS.some(d => (zone.days?.[d] ?? []).length)) return null;
   const now = new Date();
   const nowMins = now.getHours() * 60 + now.getMinutes();
   const sorted = [...slots].sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time));
-  let active = sorted[sorted.length - 1];
+  let active = null;
   for (const s of sorted) {
     if (timeToMinutes(s.time) <= nowMins) active = s;
+  }
+  if (!active) {
+    // Before today's first slot: the last slot of the most recent earlier
+    // day is still active (was: today's last slot).
+    const dayIdx = WEEKDAYS.indexOf(day);
+    for (let back = 1; back <= 7 && !active; back++) {
+      const prev = zone.days?.[WEEKDAYS[(dayIdx - back + 7) % 7]] ?? [];
+      if (prev.length) {
+        active = [...prev].sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time))[prev.length - 1];
+      }
+    }
   }
   return active?.preset ?? null;
 }
@@ -360,8 +371,18 @@ class HestiaScheduleEditor extends HTMLElement {
     const sortedMap = this._sortedSlots().map((s,i) => this._slots.indexOf(s));
     const actual = sortedMap[idx];
     const slot = {...this._slots[actual]};
-    if (field === "time") slot.time = t.value;
-    else if (field === "temperature") slot.temperature = parseFloat(t.value);
+    if (field === "time") {
+      // Changing a time can change the sort order; the rows' data-idx values
+      // refer to the OLD order, so later edits hit the wrong slot unless the
+      // editor is re-rendered.
+      if (!t.value) { this._render(); return; }
+      slot.time = t.value; this._slots[actual] = slot; this._render(); return;
+    }
+    else if (field === "temperature") {
+      const v = parseFloat(t.value);
+      if (isNaN(v)) { t.value = slot.temperature ?? 20; return; }
+      slot.temperature = v;
+    }
     else if (field === "preset") slot.preset = t.value;
     else if (field === "preemptable") { slot.preemptable = t.checked; this._slots[actual]=slot; this._render(); return; }
     else if (field === "preempt_lead_minutes") { slot.preempt_lead_minutes = parseInt(t.value) || 15; this._slots[actual]=slot; return; }
@@ -420,11 +441,11 @@ class HestiaScheduleCard extends HTMLElement {
   set hass(hass) {
     const first = !this._hass;
     this._hass = hass;
-    if (first) this._loadZones();
+    if (first) { this._loadZones(); this._subscribe(); }
     else if (this._zones) this._refreshTodayRow();
   }
 
-  connectedCallback() { this._subscribe(); }
+  connectedCallback() { this._subscribe(); this._bindCardEvents(); }
   disconnectedCallback() { if (this._unsub) { this._unsub(); this._unsub = null; } }
 
   async _loadZones() {
@@ -551,18 +572,26 @@ class HestiaScheduleCard extends HTMLElement {
 
   _findPreheatState(zoneId) {
     if (!this._hass) return null;
+    // Match on the zone_id attribute: the old substring match on entity_id
+    // made zone "bedroom" pick up "guest_bedroom"'s pre-heat sensor.
+    let fallback = null;
     for (const [eid, s] of Object.entries(this._hass.states)) {
-      if (eid.startsWith("sensor.") && eid.includes(zoneId) && eid.endsWith("_pre_heat")
-          && s.attributes.preset_temp_cache !== undefined) {
-        return s;
-      }
+      if (!eid.startsWith("sensor.") || s.attributes.preset_temp_cache === undefined) continue;
+      if (s.attributes.zone_id === zoneId) return s;
+      if (s.attributes.zone_id === undefined && !fallback && eid.endsWith(`${zoneId}_pre_heat`)) fallback = s;
     }
-    return null;
+    return fallback;
   }
 
   _buildPreheatGradient(zone, day, startTimeStr, nextSlotTime, isLive, storageKey) {
     let startMins;
-    try { const d = new Date(startTimeStr); startMins = d.getHours() * 60 + d.getMinutes(); } catch {}
+    try {
+      const d = new Date(startTimeStr);
+      // last_preheat_* survives until the next pre-heat; a pre-heat from an
+      // earlier day must not be drawn on (or saved for) today's row.
+      if (isNaN(d.getTime()) || d.toDateString() !== new Date().toDateString()) return null;
+      startMins = d.getHours() * 60 + d.getMinutes();
+    } catch {}
     if (startMins === undefined) return null;
 
     const nextSlotMins = timeToMinutes(nextSlotTime);
@@ -659,21 +688,7 @@ class HestiaScheduleCard extends HTMLElement {
       });
     });
 
-    this.addEventListener("hestia-edit-day", e => {
-      const zone = (this._zones??[]).find(z => z.zone_id === this._activeZoneId);
-      if (!zone) return;
-      this.querySelector("#editor")?.open(zone, e.detail.day);
-    });
-
-    this.addEventListener("hestia-save-schedule", async e => {
-      const { zone_id, days, slots } = e.detail;
-      for (const day of days) {
-        try {
-          localStorage.removeItem(`hestia_ph_${zone_id}_${day}`);
-          await this._hass.callWS({ type: `${DOMAIN}/update_schedule`, zone_id, day, slots });
-        } catch(err) { console.error("Save failed", err); }
-      }
-    });
+    this._bindCardEvents();
 
     const weekGrid = this.querySelector('#week-grid');
     const cursor = this.querySelector('#hover-cursor');
@@ -695,6 +710,28 @@ class HestiaScheduleCard extends HTMLElement {
       });
       weekGrid.addEventListener('mouseleave', () => { cursor.style.display = 'none'; });
     }
+  }
+
+  // Card-level listeners are attached to the card element itself, which
+  // survives re-renders.  They used to be added on every _render(), so after
+  // N renders a single Save sent N x days update_schedule calls.
+  _bindCardEvents() {
+    if (this._cardEventsBound) return;
+    this._cardEventsBound = true;
+    this.addEventListener("hestia-edit-day", e => {
+      const zone = (this._zones??[]).find(z => z.zone_id === this._activeZoneId);
+      if (!zone) return;
+      this.querySelector("#editor")?.open(zone, e.detail.day);
+    });
+    this.addEventListener("hestia-save-schedule", async e => {
+      const { zone_id, days, slots } = e.detail;
+      for (const day of days) {
+        try {
+          localStorage.removeItem(`hestia_ph_${zone_id}_${day}`);
+          await this._hass.callWS({ type: `${DOMAIN}/update_schedule`, zone_id, day, slots });
+        } catch(err) { console.error("Save failed", err); }
+      }
+    });
   }
 
   static getStubConfig() { return { type: "custom:hestia-schedule-card" }; }

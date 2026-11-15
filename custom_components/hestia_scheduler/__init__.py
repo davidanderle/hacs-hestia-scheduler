@@ -5,8 +5,9 @@ import logging
 from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import HomeAssistant, callback, Event
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import CoreState, HomeAssistant, callback, Event
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 import homeassistant.util.dt as dt_util
 
 from .const import (
@@ -22,6 +23,7 @@ from .const import (
     SERVICE_DISABLE_ZONE,
     SERVICE_SKIP_NEXT_TRANSITION,
     WEEKDAYS,
+    EVENT_ZONE_UPDATED,
 )
 from .store import async_get_registry
 from .coordinator import HestiaSchedulerCoordinator
@@ -85,11 +87,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Subscribe to MQTT topics
     await mqtt.async_setup()
 
-    # Start scheduler (with restart recovery)
-    await engine.async_start()
+    # Start scheduler (with restart recovery) only once HA has fully started.
+    # At boot the PID climate entities may not exist yet: the slot service
+    # call was silently dropped, the preset cache came up empty and the
+    # pre-heat lead was computed without a room temperature.
+    async def _async_start_engine(_event: Event | None = None) -> None:
+        if hass.data.get(DOMAIN, {}).get("engine") is not engine:
+            return  # entry was unloaded / reloaded before HA finished starting
+        await engine.async_start()
+        await mqtt.async_publish_state()
+        for zone in store.async_get_all_zones():
+            async_dispatcher_send(hass, EVENT_ZONE_UPDATED, zone.zone_id)
 
-    # Publish current schedule state to MQTT
-    await mqtt.async_publish_state()
+    if hass.state == CoreState.running:
+        await _async_start_engine()
+    else:
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _async_start_engine)
 
     # Register services
     _async_register_services(hass)
@@ -138,18 +151,56 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options flow updates (zone add/remove).
+    """Handle options flow updates (zone add/remove/edit).
 
     The OptionsFlow stores its result in entry.options, but async_setup_entry
     reads from entry.data.  Merge options back into data before reloading so
     newly added zones are picked up by the store.
+
+    async_setup_entry only *creates* zones that are missing from the store, so
+    removals and outside-sensor edits must be pushed into the store here,
+    otherwise a "removed" zone keeps being scheduled and an edited outside
+    sensor is silently ignored.
     """
     new_zones = entry.options.get(CONF_ZONES)
     if new_zones is not None:
+        old_ids = {z[ATTR_ZONE_ID] for z in entry.data.get(CONF_ZONES, [])}
+        await _async_sync_store_with_zones(hass, old_ids, new_zones)
         hass.config_entries.async_update_entry(
             entry, data={**entry.data, CONF_ZONES: new_zones}
         )
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def _async_sync_store_with_zones(
+    hass: HomeAssistant, old_ids: set[str], new_zones: list[dict]
+) -> None:
+    """Apply config-entry zone removals / outside-sensor edits to the store."""
+    from dataclasses import replace
+
+    store = await async_get_registry(hass)
+    new_ids = {z[ATTR_ZONE_ID] for z in new_zones}
+
+    # Only zones that came from the config entry are removed here; zones
+    # created through the WebSocket API are never touched.  Timers are torn
+    # down by the reload that follows.
+    for zone_id in old_ids - new_ids:
+        if store.async_delete_zone(zone_id):
+            _LOGGER.info("Zone %s removed via options", zone_id)
+
+    for zone_conf in new_zones:
+        zone = store.async_get_zone(zone_conf[ATTR_ZONE_ID])
+        if zone is None or ATTR_OUTSIDE_TEMP_ENTITY not in zone_conf:
+            continue
+        outside = zone_conf.get(ATTR_OUTSIDE_TEMP_ENTITY) or None
+        if zone.thermal.outside_temp_entity != outside:
+            _LOGGER.info(
+                "Zone %s: outside temperature sensor %s -> %s",
+                zone.zone_id, zone.thermal.outside_temp_entity, outside,
+            )
+            store.async_update_thermal_params(
+                zone.zone_id, replace(zone.thermal, outside_temp_entity=outside)
+            )
 
 
 # ---------------------------------------------------------------------------

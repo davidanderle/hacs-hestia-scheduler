@@ -41,6 +41,17 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Learning guards / least-squares fit settings
+MIN_LEARN_DELTA = 0.5          # °C: smaller rises are dominated by 0.1 °C sensor quantisation
+MIN_LEARN_MINUTES = 5.0        # min: shorter events carry no useful rate information
+MIN_OBSERVED_RATE = 0.02       # °C/hr: below this it is not a real heat-up
+MAX_OBSERVED_RATE = 10.0       # °C/hr: above this it is a glitch / external heat source
+LOSS_FACTOR_MIN = 0.005
+LOSS_FACTOR_MAX = 0.1
+FIT_WINDOW = 20                # most recent events used for the least-squares fit
+FIT_MIN_EVENTS = 5             # events (with outside temp) needed before fitting loss_factor
+FIT_MIN_OUTSIDE_SPREAD = 2.0   # °C std-dev of outside temp needed to identify the slope
+
 
 class ThermalModel:
     """Estimates and learns per-zone heat-up lead times."""
@@ -127,11 +138,32 @@ class ThermalModel:
         outside_temp: float | None,
         minutes_to_reach: float,
     ) -> None:
-        """Record an observed heat-up and update EMA model parameters."""
-        from .store import HeatUpEvent
+        """Record an observed heat-up and update the model parameters.
+
+        The model is  rate = b - c * (ref_outside - outside),  with
+        loss_factor = c / b.  A single event cannot separate b from c (one
+        equation, two unknowns), so:
+
+        * loss_factor is only re-fitted by least squares over the recent
+          history, and only once the history spans a meaningful range of
+          outside temperatures;
+        * otherwise only base_heat_rate is updated (adaptive EMA), using the
+          current loss_factor to normalise the observation to ref_outside.
+        """
+        from .store import HeatUpEvent, ZoneThermalParams
 
         zone = self.store.async_get_zone(zone_id)
         if zone is None:
+            return
+
+        # Validate BEFORE persisting, so junk events never enter the history
+        # (they would otherwise also inflate n_events and shrink alpha).
+        observed_rate = self._event_rate(start_temp, target_temp, minutes_to_reach)
+        if observed_rate is None:
+            _LOGGER.info(
+                "Zone %s: heat event ignored for learning (start=%s, reached=%s, %s min)",
+                zone_id, start_temp, target_temp, minutes_to_reach,
+            )
             return
 
         event = HeatUpEvent(
@@ -149,50 +181,33 @@ class ThermalModel:
             return
         params = zone.thermal
 
-        if minutes_to_reach <= 0:
-            return
-
-        delta = target_temp - start_temp
-        if delta <= 0:
-            return
-
-        observed_rate = (delta / minutes_to_reach) * 60.0  # convert to C/hr
-
         # Adaptive alpha: weight early observations more heavily so the model
         # converges faster when history is short (1 event/day typical).
         n_events = len(params.history)
         alpha = max(THERMAL_EMA_ALPHA, 1.0 / (n_events + 1))
 
-        # Estimate what rate the model would have predicted at this outside temp
-        effective_outside = outside_temp if outside_temp is not None else params.ref_outside_temp
-
-        # Compute adjustment factor from the observed event to update loss_factor
-        if params.base_heat_rate > 0:
-            implied_adjustment = observed_rate / params.base_heat_rate
-            outside_delta = params.ref_outside_temp - effective_outside
-            if outside_delta != 0:
-                implied_loss = (1.0 - implied_adjustment) / outside_delta
-                new_loss = alpha * implied_loss + (1.0 - alpha) * params.loss_factor
-                new_loss = max(0.005, min(0.1, new_loss))  # clamp: never fully disable outside-temp correction
-            else:
-                new_loss = params.loss_factor
+        fit = self._fit_history(params)
+        if fit is not None:
+            new_rate, new_loss = fit
+            method = "lsq"
         else:
-            new_loss = params.loss_factor
-
-        # Update base_heat_rate: use the rate at ref_outside_temp as reference
-        # i.e. what would the rate have been if outside == ref_outside?
-        if effective_outside != params.ref_outside_temp:
-            # Reverse-correct the observed rate to ref outside conditions
+            # Base-rate-only EMA update.  Normalise the observation to
+            # ref_outside conditions with the *current* loss_factor.
+            effective_outside = (
+                outside_temp if outside_temp is not None else params.ref_outside_temp
+            )
             current_adj = self._adjusted_rate(params, effective_outside)
-            correction = params.base_heat_rate / current_adj if current_adj > 0 else 1.0
-            normalised_rate = observed_rate * correction
-        else:
-            normalised_rate = observed_rate
+            if current_adj > 0:
+                normalised_rate = observed_rate * params.base_heat_rate / current_adj
+            else:
+                normalised_rate = observed_rate
+            new_rate = alpha * normalised_rate + (1.0 - alpha) * params.base_heat_rate
+            new_loss = params.loss_factor
+            method = "ema"
 
-        new_rate = alpha * normalised_rate + (1.0 - alpha) * params.base_heat_rate
         new_rate = max(0.05, min(5.0, new_rate))  # clamp to physical range
+        new_loss = max(LOSS_FACTOR_MIN, min(LOSS_FACTOR_MAX, new_loss))
 
-        from .store import ZoneThermalParams
         updated_thermal = ZoneThermalParams(
             base_heat_rate=new_rate,
             loss_factor=new_loss,
@@ -202,13 +217,65 @@ class ThermalModel:
             preset_temperatures=params.preset_temperatures,
         )
         self.store.async_update_thermal_params(zone_id, updated_thermal)
-
         _LOGGER.info(
-            "Zone %s thermal model updated: rate %.3f→%.3f C/hr, loss %.4f→%.4f "
-            "(alpha=%.2f, %d events)",
-            zone_id, params.base_heat_rate, new_rate, params.loss_factor, new_loss,
-            alpha, n_events,
+            "Zone %s thermal model updated (%s): rate %.3f→%.3f C/hr, "
+            "loss %.4f→%.4f (observed %.3f C/hr, alpha=%.2f, %d events)",
+            zone_id, method, params.base_heat_rate, new_rate, params.loss_factor,
+            new_loss, observed_rate, alpha, n_events,
         )
+
+    @staticmethod
+    def _event_rate(
+        start_temp: float | None,
+        reached_temp: float | None,
+        minutes_to_reach: float | None,
+    ) -> float | None:
+        """Return the observed heat-up rate (°C/hr), or None if the event is
+        unusable for learning (too small a rise, too short, or implausible)."""
+        try:
+            delta = float(reached_temp) - float(start_temp)
+            minutes = float(minutes_to_reach)
+        except (TypeError, ValueError):
+            return None
+        if delta < MIN_LEARN_DELTA or minutes < MIN_LEARN_MINUTES:
+            return None
+        rate = delta / minutes * 60.0
+        if not MIN_OBSERVED_RATE <= rate <= MAX_OBSERVED_RATE:
+            return None
+        return rate
+
+    def _fit_history(
+        self, params: "ZoneThermalParams"
+    ) -> tuple[float, float] | None:
+        """Least-squares fit of  rate = b - c*x,  x = ref_outside - outside,
+        over the most recent events.  Returns (base_heat_rate, loss_factor),
+        or None when there are too few events or too little spread in outside
+        temperature for the slope to be identifiable."""
+        xs: list[float] = []
+        ys: list[float] = []
+        for ev in list(params.history)[-FIT_WINDOW:]:
+            if ev.outside_temp is None:
+                continue
+            rate = self._event_rate(ev.start_temp, ev.target_temp, ev.minutes_to_reach)
+            if rate is None:
+                continue
+            xs.append(params.ref_outside_temp - float(ev.outside_temp))
+            ys.append(rate)
+
+        n = len(xs)
+        if n < FIT_MIN_EVENTS:
+            return None
+        x_mean = sum(xs) / n
+        y_mean = sum(ys) / n
+        sxx = sum((x - x_mean) ** 2 for x in xs)
+        if (sxx / n) ** 0.5 < FIT_MIN_OUTSIDE_SPREAD:
+            return None
+        sxy = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+        c = -sxy / sxx
+        b = y_mean + c * x_mean
+        if b <= 0:
+            return None
+        return b, c / b
 
     # ------------------------------------------------------------------
     # Preset temperature resolution
@@ -242,7 +309,7 @@ class ThermalModel:
             # 3. Map currently active preset to its target temperature
             preset = attrs.get("preset_mode")
             target = attrs.get("temperature")
-            if preset and target is not None:
+            if preset and preset != "none" and target is not None:
                 try:
                     self._preset_temp_cache[(zone_id, preset)] = float(target)
                 except (ValueError, TypeError):
@@ -263,7 +330,7 @@ class ThermalModel:
             return
         preset = state.attributes.get("preset_mode")
         target = state.attributes.get("temperature")
-        if not preset or target is None:
+        if not preset or preset == "none" or target is None:
             return
         try:
             temp = float(target)

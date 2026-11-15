@@ -191,6 +191,45 @@ class ZoneConfig:
         )
 
 
+def _normalise_slots(slots: list[dict]) -> list[dict]:
+    """Validate, normalise ("7:5" -> "07:05") and sort a day's slots.
+
+    Raises ValueError on malformed input so the WebSocket/service caller gets
+    an error instead of a schedule that later crashes the engine.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for raw in slots:
+        if not isinstance(raw, dict):
+            raise ValueError(f"Invalid slot {raw!r}")
+        try:
+            h_str, m_str = str(raw[ATTR_TIME]).split(":")[:2]
+            h, m = int(h_str), int(m_str)
+        except (KeyError, ValueError) as err:
+            raise ValueError(f"Invalid slot time in {raw!r}") from err
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError(f"Invalid slot time in {raw!r}")
+        time_str = f"{h:02d}:{m:02d}"
+        if time_str in seen:
+            raise ValueError(f"Duplicate slot time {time_str}")
+        seen.add(time_str)
+        slot = dict(raw)
+        slot[ATTR_TIME] = time_str
+        temp = slot.get(ATTR_TEMPERATURE)
+        if temp is not None:
+            try:
+                temp = float(temp)
+            except (TypeError, ValueError) as err:
+                raise ValueError(f"Invalid temperature in {raw!r}") from err
+            if temp != temp:  # NaN
+                raise ValueError(f"Invalid temperature in {raw!r}")
+            slot[ATTR_TEMPERATURE] = temp
+        ScheduleSlot.from_dict(slot)  # raises on preset/temperature conflicts
+        out.append(slot)
+    out.sort(key=lambda s: s[ATTR_TIME])
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Migratable HA Store
 # ---------------------------------------------------------------------------
@@ -289,7 +328,7 @@ class ScheduleStorage:
     def async_update_zone_schedule(self, zone_id: str, day: str, slots: list[dict]) -> ZoneConfig:
         zone = self.zones[zone_id]
         zone_dict = zone.to_dict()
-        zone_dict[ATTR_DAYS][day] = slots
+        zone_dict[ATTR_DAYS][day] = _normalise_slots(slots)
         updated = ZoneConfig.from_dict(zone_dict)
         self.zones[zone_id] = updated
         self.async_schedule_save()

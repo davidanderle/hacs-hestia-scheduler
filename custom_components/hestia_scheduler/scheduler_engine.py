@@ -68,23 +68,39 @@ def _slot_key(slot: "ScheduleSlot") -> dtime:
     return dtime(int(h), int(m))
 
 
-def find_active_slot(
+def _sorted_slots(zone: "ZoneConfig", day_key: str) -> list["ScheduleSlot"]:
+    """Return a day's slots in chronological order.
+
+    The card always sends sorted slots, but the set_zone_schedule service
+    (and hand-edited storage) may not; every lookup below assumes order.
+    """
+    return sorted(zone.days.get(day_key, []), key=_slot_key)
+
+
+def _slot_dt(day_dt: datetime, slot: "ScheduleSlot") -> datetime:
+    """Return the UTC datetime at which `slot` fires on the local day of `day_dt`."""
+    h, m = slot.time.split(":")
+    local = day_dt.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+    return dt_util.as_utc(local)
+
+
+def find_active_slot_with_start(
     zone: "ZoneConfig",
     now: datetime,
-) -> tuple["ScheduleSlot | None", int]:
-    """Return (active_slot, slot_index) for the given datetime, spanning midnight.
+) -> tuple["ScheduleSlot | None", int, datetime | None]:
+    """Return (active_slot, slot_index, slot_start_utc) for `now`, spanning midnight.
 
-    Returns (None, -1) if the zone has no slots on any day.
+    Walks back up to 7 days (day 7 = same weekday last week, needed when only
+    one day of the week has slots and `now` is before its first slot).
+    Returns (None, -1, None) if the zone has no slots on any day.
     """
-    # We look at today's schedule first, then walk backwards up to 6 days
-    # to find the last slot that fired at or before `now`.
     now_local = dt_util.as_local(now)
     now_time = now_local.time().replace(second=0, microsecond=0)
 
-    for days_back in range(7):
+    for days_back in range(8):
         check_dt = now_local - timedelta(days=days_back)
         day_key = PYTHON_WEEKDAY_MAP[check_dt.weekday()]
-        slots = zone.days.get(day_key, [])
+        slots = _sorted_slots(zone, day_key)
         if not slots:
             continue
 
@@ -93,12 +109,25 @@ def find_active_slot(
             candidates = [(i, s) for i, s in enumerate(slots) if _slot_key(s) <= now_time]
             if candidates:
                 i, s = candidates[-1]
-                return s, i
+                return s, i, _slot_dt(check_dt, s)
         else:
             # Earlier day: the last slot of that day is active
-            return slots[-1], len(slots) - 1
+            s = slots[-1]
+            return s, len(slots) - 1, _slot_dt(check_dt, s)
 
-    return None, -1
+    return None, -1, None
+
+
+def find_active_slot(
+    zone: "ZoneConfig",
+    now: datetime,
+) -> tuple["ScheduleSlot | None", int]:
+    """Return (active_slot, slot_index) for the given datetime, spanning midnight.
+
+    Returns (None, -1) if the zone has no slots on any day.
+    """
+    slot, idx, _ = find_active_slot_with_start(zone, now)
+    return slot, idx
 
 
 def find_next_slot(
@@ -111,24 +140,19 @@ def find_next_slot(
 
     # Today's remaining slots
     today_key = PYTHON_WEEKDAY_MAP[now_local.weekday()]
-    today_slots = zone.days.get(today_key, [])
-    future_today = [s for s in today_slots if _slot_key(s) > now_time]
+    future_today = [s for s in _sorted_slots(zone, today_key) if _slot_key(s) > now_time]
     if future_today:
         slot = future_today[0]
-        h, m = slot.time.split(":")
-        next_dt = now_local.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-        return slot, dt_util.as_utc(next_dt)
+        return slot, _slot_dt(now_local, slot)
 
     # Subsequent days (up to 7)
     for days_ahead in range(1, 8):
         check_dt = now_local + timedelta(days=days_ahead)
         day_key = PYTHON_WEEKDAY_MAP[check_dt.weekday()]
-        slots = zone.days.get(day_key, [])
+        slots = _sorted_slots(zone, day_key)
         if slots:
             slot = slots[0]
-            h, m = slot.time.split(":")
-            next_dt = check_dt.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-            return slot, dt_util.as_utc(next_dt)
+            return slot, _slot_dt(check_dt, slot)
 
     return None, None
 
@@ -160,6 +184,9 @@ class ZoneTimer:
         self._temp_track_cancel = None
         self._preempt_task: asyncio.Task | None = None
         self._skip_next: bool = False
+        # Set by the skip_next_transition service.  Unlike _skip_next it is
+        # NOT cleared by _async_schedule_next, and applies to any slot.
+        self._manual_skip: bool = False
         self._user_responded: bool = False
 
         # State for rollback / heat event tracking
@@ -178,8 +205,18 @@ class ZoneTimer:
     # Start / stop
     # ------------------------------------------------------------------
 
-    async def async_start(self, shutdown_time: datetime | None = None) -> None:
-        """Start the zone timer, handling restart recovery if needed."""
+    async def async_start(
+        self,
+        shutdown_time: datetime | None = None,
+        previous_active: "ScheduleSlot | None" = None,
+    ) -> None:
+        """Start the zone timer, handling restart recovery if needed.
+
+        previous_active: on a reload (schedule edit), the slot that was active
+        before.  If it is unchanged the slot is NOT re-applied, so editing an
+        unrelated day no longer wipes a manual wall-thermostat override, a
+        rollback, or an in-progress pre-heat.
+        """
         zone = self.store.async_get_zone(self.zone_id)
         if zone is None or not zone.enabled:
             return
@@ -188,13 +225,22 @@ class ZoneTimer:
         self.thermal.update_preset_cache(self.zone_id)
 
         now = dt_util.utcnow()
-        active_slot, _ = find_active_slot(zone, now)
+        active_slot, _, active_start = find_active_slot_with_start(zone, now)
 
         if shutdown_time is not None:
-            await self._async_recover_from_shutdown(zone, shutdown_time, now, active_slot)
+            await self._async_recover_from_shutdown(
+                zone, shutdown_time, now, active_slot, active_start
+            )
         elif active_slot is not None:
-            # Fresh start (no prior shutdown timestamp): apply current slot
-            await self._async_apply_slot(active_slot, is_recovery=False)
+            if previous_active is not None and previous_active == active_slot:
+                self.active_slot = active_slot
+                _LOGGER.debug(
+                    "Zone %s: reload with unchanged active slot %s, not re-applying",
+                    self.zone_id, active_slot.time,
+                )
+            else:
+                # Fresh start / active slot changed: apply current slot
+                await self._async_apply_slot(active_slot, is_recovery=False)
 
         await self._async_schedule_next()
         self._subscribe_temp_changes()
@@ -207,8 +253,14 @@ class ZoneTimer:
 
     async def async_reload(self) -> None:
         """Reload when schedule config changes."""
+        previous_active = self.active_slot
+        was_preheating = self.preheating
         await self.async_stop()
-        await self.async_start()
+        if was_preheating:
+            # The pre-heat will be re-evaluated (and restarted if still due)
+            # by _async_schedule_next; discard the partial learning sample.
+            self._reset_preheat_state()
+        await self.async_start(previous_active=previous_active)
 
     # ------------------------------------------------------------------
     # Restart recovery
@@ -220,12 +272,18 @@ class ZoneTimer:
         shutdown_time: datetime,
         now: datetime,
         current_active_slot: "ScheduleSlot | None",
+        current_active_start: datetime | None = None,
     ) -> None:
         slot_at_shutdown, _ = find_active_slot(zone, shutdown_time)
         if current_active_slot is None:
             return
 
-        if slot_at_shutdown and slot_at_shutdown.time == current_active_slot.time:
+        # A transition was missed iff the currently active slot started after
+        # shutdown.  Comparing only the "HH:MM" strings missed transitions
+        # whenever the downtime spanned a slot with the same time on another
+        # day (e.g. a 24 h outage, or Mon 22:00 eco -> Tue 22:00 sleep).
+        if current_active_start is not None and current_active_start <= shutdown_time:
+            self.active_slot = current_active_slot
             _LOGGER.debug(
                 "Zone %s: same slot at shutdown (%s), no action needed",
                 self.zone_id, current_active_slot.time,
@@ -288,8 +346,8 @@ class ZoneTimer:
             now.isoformat(),
         )
 
-        # Calculate pre-heat lead time
-        lead_minutes = self._calc_lead_minutes(next_slot)
+        # Calculate pre-heat lead time (never pre-heat a slot that will be skipped)
+        lead_minutes = 0 if self._manual_skip else self._calc_lead_minutes(next_slot)
         preheat_dt = next_dt - timedelta(minutes=lead_minutes) if lead_minutes > 0 else None
 
         if preheat_dt is not None and preheat_dt <= now + timedelta(seconds=30):
@@ -373,11 +431,25 @@ class ZoneTimer:
     ) -> None:
         """Apply the target temperature early so the room reaches it by next_dt."""
         self._cancel_preheat_timer()
-        self.preheating = True
+        if self._manual_skip or self.preheating:
+            return
 
         current_temp = self.thermal.get_current_temp(self.zone_id)
         outside_temp = self.thermal.get_outside_temp(self.zone_id)
         target_temp = self._resolve_target_temp(next_slot)
+
+        # Conditions may have changed since the timer was armed (sun, cooking,
+        # another zone).  Applying a non-warming slot early would also pre-empt
+        # a setback before the user had a chance to cancel it.
+        if target_temp is None or (current_temp is not None and current_temp >= target_temp):
+            _LOGGER.info(
+                "Zone %s: pre-heat for %s no longer needed (current=%s, target=%s)",
+                self.zone_id, next_slot.time, current_temp, target_temp,
+            )
+            async_dispatcher_send(self.hass, EVENT_PREHEAT_UPDATE, self.zone_id)
+            return
+
+        self.preheating = True
 
         # Store context for later heat event recording
         self._preheat_start_temp = current_temp
@@ -475,18 +547,34 @@ class ZoneTimer:
         if zone is None or not zone.enabled:
             return
 
-        # Record current state for rollback context
+        # Record current state for rollback context.  While pre-heating the
+        # climate entity already holds the NEW slot, so the "previous" state
+        # must come from the slot that was active before the pre-heat.
         climate_state = self.hass.states.get(zone.climate_entity)
         prev_temp = None
         prev_preset = None
-        if climate_state:
+        if self.preheating and self.active_slot is not None:
+            prev_temp = self.active_slot.temperature
+            prev_preset = self.active_slot.preset
+        elif climate_state:
             prev_temp = climate_state.attributes.get("temperature")
             prev_preset = climate_state.attributes.get("preset_mode")
+            if prev_preset == "none":
+                prev_preset = None
 
-        # Check if preemption response said to skip
-        if slot.preemptable and self._skip_next:
+        # Check if preemption response (or the skip service) said to skip
+        if (slot.preemptable and self._skip_next) or self._manual_skip:
+            manual = self._manual_skip
             self._skip_next = False
-            _LOGGER.info("Zone %s: transition skipped by preemption response", self.zone_id)
+            self._manual_skip = False
+            _LOGGER.info(
+                "Zone %s: transition skipped by %s",
+                self.zone_id,
+                "skip_next_transition service" if manual else "preemption response",
+            )
+            if self.preheating:
+                # The pre-heat already applied the skipped slot: undo it.
+                await self._async_revert_preheat()
             key = self._override_key(slot_dt, slot.time)
             self._record_slot_override(
                 key,
@@ -707,6 +795,39 @@ class ZoneTimer:
         state = self.hass.states.get(zone.climate_entity)
         return state is not None and state.state == "off"
 
+    def _reset_preheat_state(self) -> None:
+        """Clear pre-heat bookkeeping without touching the climate entity."""
+        self._preheat_start_time = None
+        self._preheat_start_temp = None
+        self._preheat_outside_temp = None
+        self._preheat_target_temp = None
+        self.preheating = False
+
+    async def _async_revert_preheat(self) -> None:
+        """Undo a running pre-heat: restore the active slot, discard learning data."""
+        self._cancel_preheat_timer()
+        self._reset_preheat_state()
+        zone = self.store.async_get_zone(self.zone_id)
+        if zone is not None and self.active_slot is not None:
+            _LOGGER.info(
+                "Zone %s: reverting pre-heat, restoring active slot %s",
+                self.zone_id, self.active_slot.time,
+            )
+            await self._async_call_climate(zone.climate_entity, self.active_slot)
+        async_dispatcher_send(self.hass, EVENT_PREHEAT_UPDATE, self.zone_id)
+
+    async def async_request_skip_next(self) -> None:
+        """skip_next_transition service: skip the upcoming slot once."""
+        self._manual_skip = True
+        self._cancel_preheat_timer()
+        if self.preheating:
+            await self._async_revert_preheat()
+        _LOGGER.info(
+            "Zone %s: next transition (%s) will be skipped",
+            self.zone_id, self.next_slot.time if self.next_slot else "none",
+        )
+        async_dispatcher_send(self.hass, EVENT_PREHEAT_UPDATE, self.zone_id)
+
     def _abort_preheat(self) -> None:
         """Cancel the running pre-heat cycle without recording a heat event."""
         _LOGGER.info(
@@ -729,7 +850,10 @@ class ZoneTimer:
 
         target = self._resolve_target_temp(slot)
         if target is None:
-            return DEFAULT_MIN_LEAD_MINUTES
+            # Unknown preset temperature: we cannot tell whether this is a
+            # warming slot.  Pre-heating a setback (e.g. "away") would apply it
+            # early and bypass its pre-emption notification.
+            return 0
 
         current = self.thermal.get_current_temp(self.zone_id)
         if current is None:
@@ -771,7 +895,7 @@ class ZoneTimer:
             self._check_target_reached()
             return
 
-        if self.next_slot is None or self.next_transition_dt is None:
+        if self.next_slot is None or self.next_transition_dt is None or self._manual_skip:
             return
 
         now = dt_util.utcnow()
@@ -962,15 +1086,18 @@ class SchedulerEngine:
         timer = self._timers.get(zone_id)
         if timer:
             await timer.async_stop()
+            timer._reset_preheat_state()
+            timer._manual_skip = False
+            # Force the active slot to be re-applied when the zone is re-enabled
+            timer.active_slot = None
 
     async def async_skip_next_transition(self, zone_id: str) -> None:
         """Force-skip the very next transition for a zone (manual override)."""
+        # The old code cancelled the timers and re-ran _async_schedule_next,
+        # which simply re-armed the SAME next slot: nothing was ever skipped.
         timer = self._timers.get(zone_id)
         if timer:
-            timer._cancel_main_timer()
-            timer._cancel_preheat_timer()
-            # Re-schedule, jumping past the next slot
-            await timer._async_schedule_next()
+            await timer.async_request_skip_next()
 
     def get_zone_timer(self, zone_id: str) -> ZoneTimer | None:
         return self._timers.get(zone_id)

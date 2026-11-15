@@ -65,7 +65,11 @@ async def async_setup_entry(
             HestiaPreHeatSensor(hass, zone.zone_id, zone.name),
         ])
 
-    async_dispatcher_connect(hass, EVENT_ZONE_CREATED, _on_zone_created)
+    # Disconnect on unload, otherwise every reload (e.g. adding a zone via
+    # Options) leaves a stale listener bound to a torn-down platform.
+    entry.async_on_unload(
+        async_dispatcher_connect(hass, EVENT_ZONE_CREATED, _on_zone_created)
+    )
 
 
 class HestiaZoneSensor(SensorEntity):
@@ -170,6 +174,7 @@ class HestiaPreHeatSensor(SensorEntity):
         self._last_preheat_next_slot_time: str | None = None
         self._last_preheat_start_room_temp: float | None = None
         self._last_preheat_target_temp: float | None = None
+        self._entity_unsub = None
 
     @property
     def device_info(self):
@@ -221,14 +226,22 @@ class HestiaPreHeatSensor(SensorEntity):
         if zone.thermal.outside_temp_entity:
             track_entities.append(zone.thermal.outside_temp_entity)
 
-        # Avoid duplicate subscriptions
-        if hasattr(self, "_entity_unsub") and self._entity_unsub is not None:
+        # Avoid duplicate subscriptions.  The handle is NOT registered with
+        # async_on_remove: it is replaced on re-subscribe, and the old code
+        # registered every handle, so the first one was called twice on
+        # entity removal (once here, once by HA).
+        if self._entity_unsub is not None:
             self._entity_unsub()
+            self._entity_unsub = None
 
         self._entity_unsub = async_track_state_change_event(
             self.hass, track_entities, self._on_entity_state_change
         )
-        self.async_on_remove(self._entity_unsub)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._entity_unsub is not None:
+            self._entity_unsub()
+            self._entity_unsub = None
 
     @callback
     def _on_entity_state_change(self, event) -> None:
@@ -304,6 +317,9 @@ class HestiaPreHeatSensor(SensorEntity):
             self._attr_icon = "mdi:radiator-disabled"
 
         attrs: dict = {
+            # Lets the card find this sensor by zone without guessing from the
+            # entity_id ("bedroom" is a substring of "guest_bedroom").
+            "zone_id": self._zone_id,
             "current_room_temp": round(current_temp, 1) if current_temp is not None else None,
             "outside_temp": round(outside_temp, 1) if outside_temp is not None else None,
             "base_heat_rate_c_hr": params.base_heat_rate,
