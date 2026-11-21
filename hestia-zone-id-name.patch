@@ -1,0 +1,451 @@
+diff --git a/README.md b/README.md
+index 07da207..8bf5f74 100644
+--- a/README.md
++++ b/README.md
+@@ -317,6 +317,19 @@ Copy `custom_components/hestia_scheduler/` into your HA config `custom_component
+ 
+ Go to **Settings → Integrations → Hestia Scheduler → Configure** and choose **Add zone**.
+ 
++### Renaming a zone ID
++
++The zone **name** is just a label, but the zone **ID** is the key used in MQTT topics, service calls and the card config, and it can't be edited in the options flow (which would treat a changed ID as "remove zone + add zone" and lose the schedule and learned thermal data). To change it, call the `hestia_scheduler.rename_zone` action from **Developer Tools → Actions**:
++
++```yaml
++action: hestia_scheduler.rename_zone
++data:
++  zone_id: downstairs
++  new_zone_id: "1"
++```
++
++The schedule, learned thermal parameters, skipped/rolled-back slot history and the zone's entities (`entity_id`s and history) are kept, and the integration reloads itself. Afterwards, update anything of yours that used the old ID: automations calling this integration's actions, MQTT topics you match on explicitly, and a card's `zone_id` / `default_zone` option.
++
+ ### Lovelace card setup
+ 
+ The card resource is registered automatically by the integration. If needed, manually add `/hestia_scheduler/hestia-schedule-card.js` as a module in **Lovelace resources**.
+@@ -342,12 +355,29 @@ Restart Mosquitto after editing.
+ 
+ | Topic | Direction | Purpose |
+ |-------|-----------|---------|
+-| `hestia/scheduler/{zone}/preempt` | Server 1 → Server 2 | Pre-transition notification payload |
+-| `hestia/scheduler/{zone}/preempt/response` | Server 2 → Server 1 | User response: `{"action": "skip"}` or `{"action": "proceed"}` |
+-| `hestia/scheduler/{zone}/transition` | Server 1 → Server 2 | Post-transition event (includes rollback context) |
+-| `hestia/scheduler/{zone}/rollback` | Server 2 → Server 1 | Rollback command: `{"action": "restore_previous"}` |
++| `hestia/scheduler/{zone_id}/preempt` | Server 1 → Server 2 | Pre-transition notification payload |
++| `hestia/scheduler/{zone_id}/preempt/response` | Server 2 → Server 1 | User response: `{"action": "skip"}` or `{"action": "proceed"}` |
++| `hestia/scheduler/{zone_id}/transition` | Server 1 → Server 2 | Post-transition event (includes rollback context) |
++| `hestia/scheduler/{zone_id}/rollback` | Server 2 → Server 1 | Rollback command: `{"action": "restore_previous"}` |
+ | `hestia/scheduler/state` | Server 1 → Server 2 | Full retained schedule state |
+ 
++Every zone-specific payload identifies the zone the same way as the state message does: `zone_id` is the machine identifier (the same value as in the topic — use it for topics and notification tags) and `name` is the display name (use it in anything user-facing).
++
++**`preempt`**
++
++```json
++{"zone_id": "3", "name": "Study", "current_temp": 19.5, "current_preset": "home",
++ "next_temp": null, "next_preset": "away", "scheduled_time": "08:30", "deadline_seconds": 900}
++```
++
++**`transition`**
++
++```json
++{"zone_id": "3", "name": "Study", "event": "transition_executed", "user_responded": false,
++ "new_temp": null, "new_preset": "away", "previous_temp": null, "previous_preset": "home",
++ "rollback_available": true, "rollback_expires": "2026-01-01T14:30:00+00:00"}
++```
++
+ ---
+ 
+ ## Server 2 Automations
+@@ -364,25 +394,25 @@ triggers:
+ actions:
+   - variables:
+       data: "{{ trigger.payload | from_json }}"
+-      zone: "{{ data.zone }}"
++      zone_id: "{{ data.zone_id }}"
++      zone_name: "{{ data.name }}"
+       current_preset: "{{ data.current_preset | default('unknown') }}"
+       next_preset: "{{ data.next_preset | default(none) }}"
+       next_temp: "{{ data.next_temp | default(none) }}"
+       scheduled_time: "{{ data.scheduled_time }}"
+       deadline: "{{ data.deadline_seconds | int(60) }}"
+       action_skip: HESTIA_PREEMPT_SKIP_{{ context.id }}
+-      action_proceed: HESTIA_PREEMPT_PROCEED_{{ context.id }}
+       target_label: >-
+         {% if next_preset %}{{ next_preset }}{% else %}{{ next_temp }}°C{% endif
+         %}
+   - action: notify.all_phones
+     data:
+-      title: 🌡️ {{ zone | title }} schedule change
++      title: 🌡️ {{ zone_name }} schedule change
+       message: >-
+         Switching to '{{ target_label }}' at {{ scheduled_time }}. Cancel or it
+         proceeds automatically.
+       data:
+-        tag: hestia_preempt_{{ zone }}
++        tag: hestia_preempt_{{ zone_id }}
+         ttl: 0
+         priority: high
+         actions:
+@@ -396,7 +426,7 @@ actions:
+       - trigger: event
+         event_type: mobile_app_notification_cleared
+         event_data:
+-          tag: hestia_preempt_{{ zone }}
++          tag: hestia_preempt_{{ zone_id }}
+     timeout:
+       seconds: "{{ deadline | int }}"
+     continue_on_timeout: true
+@@ -410,7 +440,7 @@ actions:
+             'mobile_app_notification_action' %}skip{% else %}proceed{% endif %}
+       - action: mqtt.publish
+         data:
+-          topic: hestia/scheduler/{{ zone }}/preempt/response
++          topic: hestia/scheduler/{{ zone_id }}/preempt/response
+           payload: "{\"action\": \"{{ response }}\"}"
+ mode: parallel
+ max: 4
+@@ -428,23 +458,25 @@ triggers:
+ conditions:
+   - condition: template
+     value_template: >-
+-      {% set d = trigger.payload | from_json %} {{ d.rollback_available |
+-      default(false) and not d.user_responded | default(true) }}
++      {% set d = trigger.payload | from_json %}
++      {{ (d.rollback_available | default(false))
++         and not (d.user_responded | default(false)) }}
+ actions:
+   - variables:
+       data: "{{ trigger.payload | from_json }}"
+-      zone: "{{ data.zone }}"
++      zone_id: "{{ data.zone_id }}"
++      zone_name: "{{ data.name }}"
+       new_preset: "{{ data.new_preset | default('unknown') }}"
+       prev_preset: "{{ data.previous_preset | default('unknown') }}"
+       action_restore: HESTIA_ROLLBACK_{{ context.id }}
+   - action: notify.all_phones
+     data:
+-      title: 🌡️ {{ zone | title }} schedule change
++      title: 🌡️ {{ zone_name }} schedule change
+       message: >-
+         Switched from '{{ prev_preset }}' to '{{ new_preset }}'. Tap restore to
+         undo.
+       data:
+-        tag: hestia_rollback_{{ zone }}
++        tag: hestia_rollback_{{ zone_id }}
+         ttl: 0
+         priority: high
+         actions:
+@@ -463,13 +495,14 @@ actions:
+     then:
+       - action: mqtt.publish
+         data:
+-          topic: hestia/scheduler/{{ zone }}/rollback
++          topic: hestia/scheduler/{{ zone_id }}/rollback
+           payload: "{\"action\": \"restore_previous\"}"
+       - action: notify.all_phones
+         data:
+-          message: "{{ zone | title }} schedule restored to {{ prev_preset }}."
++          title: 🌡️ {{ zone_name }} schedule restored
++          message: "{{ zone_name }} schedule restored to {{ prev_preset }}."
+           data:
+-            tag: hestia_rollback_{{ zone }}
++            tag: hestia_rollback_{{ zone_id }}
+ mode: parallel
+ max: 4
+ ```
+@@ -538,6 +571,7 @@ The integration creates two sensor entities per zone, visible under **Settings 
+ | `hestia_scheduler.enable_zone` | Enable scheduling for a zone |
+ | `hestia_scheduler.disable_zone` | Disable scheduling (heating continues but is not auto-controlled) |
+ | `hestia_scheduler.skip_next_transition` | Skip the next scheduled transition (one-off manual override) |
++| `hestia_scheduler.rename_zone` | Change a zone's ID (`zone_id` → `new_zone_id`), keeping its schedule, learned thermal data and entities |
+ 
+ ---
+ 
+diff --git a/custom_components/hestia_scheduler/__init__.py b/custom_components/hestia_scheduler/__init__.py
+index 164100a..c487d1a 100644
+--- a/custom_components/hestia_scheduler/__init__.py
++++ b/custom_components/hestia_scheduler/__init__.py
+@@ -22,6 +22,7 @@ from .const import (
+     SERVICE_ENABLE_ZONE,
+     SERVICE_DISABLE_ZONE,
+     SERVICE_SKIP_NEXT_TRANSITION,
++    SERVICE_RENAME_ZONE,
+     WEEKDAYS,
+     EVENT_ZONE_UPDATED,
+ )
+@@ -233,6 +234,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
+         engine: SchedulerEngine = hass.data[DOMAIN]["engine"]
+         await engine.async_skip_next_transition(call.data["zone_id"])
+ 
++    async def _svc_rename_zone(call) -> None:
++        await _async_rename_zone(hass, call.data["zone_id"], call.data["new_zone_id"])
++
+     hass.services.async_register(
+         DOMAIN, SERVICE_SET_ZONE_SCHEDULE, _svc_set_schedule,
+         schema=vol.Schema({
+@@ -253,9 +257,96 @@ def _async_register_services(hass: HomeAssistant) -> None:
+         DOMAIN, SERVICE_SKIP_NEXT_TRANSITION, _svc_skip_next,
+         schema=vol.Schema({vol.Required("zone_id"): cv.string}),
+     )
++    hass.services.async_register(
++        DOMAIN, SERVICE_RENAME_ZONE, _svc_rename_zone,
++        schema=vol.Schema({
++            vol.Required("zone_id"): cv.string,
++            vol.Required("new_zone_id"): cv.string,
++        }),
++    )
+     _LOGGER.debug("Hestia Scheduler services registered")
+ 
+ 
++async def _async_rename_zone(hass: HomeAssistant, old_id: str, new_id: str) -> None:
++    """Change a zone's ID everywhere it is persisted.
++
++    The ID is the key of the zone in the schedule store, in the config entry
++    (data and options), and in the unique IDs of the zone's sensors and the
++    identifiers of its device.  Renaming through the options flow would be
++    seen as "remove zone + add zone" and lose the schedule and learned
++    thermal data, so all of them are moved together here.
++    """
++    from homeassistant.exceptions import ServiceValidationError
++    from homeassistant.helpers import device_registry as dr, entity_registry as er
++
++    # Same normalisation as the config flow.
++    new_id = new_id.strip().lower().replace(" ", "_")
++    store = hass.data[DOMAIN]["store"]
++
++    if store.async_get_zone(old_id) is None:
++        raise ServiceValidationError(f"Zone {old_id!r} not found")
++    if not new_id or any(c in new_id for c in "/+#"):
++        # The ID is a level in the MQTT topics (hestia/scheduler/<id>/...).
++        raise ServiceValidationError(
++            f"Invalid zone ID {new_id!r}: must not be empty or contain '/', '+' or '#'"
++        )
++    if new_id == old_id:
++        return
++    if store.async_get_zone(new_id) is not None:
++        raise ServiceValidationError(f"Zone {new_id!r} already exists")
++
++    # 1. Schedule store (persisted immediately, before anything can reload).
++    store.async_rename_zone(old_id, new_id)
++    await store.async_save()
++
++    # 2. Entity / device registries, so the sensors keep their entity_ids,
++    #    history and customisations instead of being recreated.
++    ent_reg = er.async_get(hass)
++    for suffix in ("schedule", "preheat"):
++        entity_id = ent_reg.async_get_entity_id(
++            "sensor", DOMAIN, f"{DOMAIN}_{old_id}_{suffix}"
++        )
++        if entity_id:
++            ent_reg.async_update_entity(
++                entity_id, new_unique_id=f"{DOMAIN}_{new_id}_{suffix}"
++            )
++    dev_reg = dr.async_get(hass)
++    device = dev_reg.async_get_device(identifiers={(DOMAIN, old_id)})
++    if device:
++        dev_reg.async_update_device(device.id, new_identifiers={(DOMAIN, new_id)})
++
++    # 3. Config entry.  Zones created in the options flow / config flow are
++    #    listed in entry.data and/or entry.options and would otherwise be
++    #    re-created under the old ID on the next start.
++    entries = hass.config_entries.async_entries(DOMAIN)
++    if not entries:
++        return
++    entry = entries[0]
++    data, options = dict(entry.data), dict(entry.options)
++    changed = False
++    for conf in (data, options):
++        zones = conf.get(CONF_ZONES)
++        if not zones:
++            continue
++        renamed = [
++            {**z, ATTR_ZONE_ID: new_id} if z.get(ATTR_ZONE_ID) == old_id else z
++            for z in zones
++        ]
++        if renamed != zones:
++            conf[CONF_ZONES] = renamed
++            changed = True
++
++    _LOGGER.info("Zone %s renamed to %s", old_id, new_id)
++
++    # Updating the entry makes the update listener reload it; otherwise
++    # reload explicitly so timers, MQTT subscriptions and sensors pick up
++    # the new ID.
++    if not (changed and hass.config_entries.async_update_entry(
++        entry, data=data, options=options
++    )):
++        await hass.config_entries.async_reload(entry.entry_id)
++
++
+ # ---------------------------------------------------------------------------
+ # Frontend (serve built JS card)
+ # ---------------------------------------------------------------------------
+diff --git a/custom_components/hestia_scheduler/const.py b/custom_components/hestia_scheduler/const.py
+index 450e817..9271e45 100644
+--- a/custom_components/hestia_scheduler/const.py
++++ b/custom_components/hestia_scheduler/const.py
+@@ -93,10 +93,10 @@ DEFAULT_ROLLBACK_WINDOW_FRACTION = 0.5  # rollback expires halfway to next slot
+ # -------------------------------------------------------------------
+ # MQTT topics
+ # -------------------------------------------------------------------
+-MQTT_TOPIC_PREEMPT = "hestia/scheduler/{zone}/preempt"
+-MQTT_TOPIC_PREEMPT_RESPONSE = "hestia/scheduler/{zone}/preempt/response"
+-MQTT_TOPIC_TRANSITION = "hestia/scheduler/{zone}/transition"
+-MQTT_TOPIC_ROLLBACK = "hestia/scheduler/{zone}/rollback"
++MQTT_TOPIC_PREEMPT = "hestia/scheduler/{zone_id}/preempt"
++MQTT_TOPIC_PREEMPT_RESPONSE = "hestia/scheduler/{zone_id}/preempt/response"
++MQTT_TOPIC_TRANSITION = "hestia/scheduler/{zone_id}/transition"
++MQTT_TOPIC_ROLLBACK = "hestia/scheduler/{zone_id}/rollback"
+ MQTT_TOPIC_STATE = "hestia/scheduler/state"
+ 
+ # -------------------------------------------------------------------
+@@ -106,6 +106,7 @@ SERVICE_SET_ZONE_SCHEDULE = "set_zone_schedule"
+ SERVICE_ENABLE_ZONE = "enable_zone"
+ SERVICE_DISABLE_ZONE = "disable_zone"
+ SERVICE_SKIP_NEXT_TRANSITION = "skip_next_transition"
++SERVICE_RENAME_ZONE = "rename_zone"
+ 
+ # -------------------------------------------------------------------
+ # Attribute / data keys used in dicts across the integration
+diff --git a/custom_components/hestia_scheduler/mqtt_handler.py b/custom_components/hestia_scheduler/mqtt_handler.py
+index a5cf059..e1a7d5e 100644
+--- a/custom_components/hestia_scheduler/mqtt_handler.py
++++ b/custom_components/hestia_scheduler/mqtt_handler.py
+@@ -59,6 +59,16 @@ class MqttHandler:
+         """
+         self._rollback_callback = cb
+ 
++    def _zone_name(self, zone_id: str) -> str:
++        """Return the display name for a zone, falling back to its zone_id.
++
++        zone_id is a machine identifier (used in topics and tags) and may be
++        a plain number, so payloads also carry the name for anything
++        user-facing.
++        """
++        zone = self.store.async_get_zone(zone_id)
++        return zone.name if zone and zone.name else zone_id
++
+     async def async_setup(self) -> None:
+         """Subscribe to all relevant MQTT topics."""
+         zones = self.store.async_get_all_zones()
+@@ -74,8 +84,8 @@ class MqttHandler:
+         if zone_id in self._subscribed_zones:
+             return
+         self._subscribed_zones.add(zone_id)
+-        response_topic = MQTT_TOPIC_PREEMPT_RESPONSE.format(zone=zone_id)
+-        rollback_topic = MQTT_TOPIC_ROLLBACK.format(zone=zone_id)
++        response_topic = MQTT_TOPIC_PREEMPT_RESPONSE.format(zone_id=zone_id)
++        rollback_topic = MQTT_TOPIC_ROLLBACK.format(zone_id=zone_id)
+ 
+         @callback
+         def _on_preempt_response(msg) -> None:
+@@ -153,7 +163,8 @@ class MqttHandler:
+           - user_responded: True if the user explicitly tapped a button
+         """
+         payload = {
+-            "zone": zone_id,
++            "zone_id": zone_id,
++            "name": self._zone_name(zone_id),
+             "current_temp": current_temp,
+             "current_preset": current_preset,
+             "next_temp": next_temp,
+@@ -161,7 +172,7 @@ class MqttHandler:
+             "scheduled_time": scheduled_time,
+             "deadline_seconds": lead_seconds,
+         }
+-        topic = MQTT_TOPIC_PREEMPT.format(zone=zone_id)
++        topic = MQTT_TOPIC_PREEMPT.format(zone_id=zone_id)
+         await async_publish(
+             self.hass,
+             topic,
+@@ -229,9 +240,9 @@ class MqttHandler:
+             }
+ 
+         payload = {
+-            "zone": zone_id,
++            "zone_id": zone_id,
++            "name": self._zone_name(zone_id),
+             "event": "transition_executed",
+-            "was_preemptable": True,
+             "user_responded": user_responded,
+             "new_temp": new_temp,
+             "new_preset": new_preset,
+@@ -240,7 +251,7 @@ class MqttHandler:
+             "rollback_available": rollback_available,
+             "rollback_expires": expires.isoformat() if expires else None,
+         }
+-        topic = MQTT_TOPIC_TRANSITION.format(zone=zone_id)
++        topic = MQTT_TOPIC_TRANSITION.format(zone_id=zone_id)
+         await async_publish(
+             self.hass,
+             topic,
+diff --git a/custom_components/hestia_scheduler/services.yaml b/custom_components/hestia_scheduler/services.yaml
+index d6d30c8..abc73f2 100644
+--- a/custom_components/hestia_scheduler/services.yaml
++++ b/custom_components/hestia_scheduler/services.yaml
+@@ -69,3 +69,26 @@ skip_next_transition:
+       example: "downstairs"
+       selector:
+         text:
++
++rename_zone:
++  name: Rename Zone ID
++  description: >
++    Change the ID of a zone (the machine identifier used in MQTT topics,
++    service calls and the card config, not the display name). The schedule,
++    learned thermal data and entities are kept. Update any automations or
++    dashboards that refer to the old ID.
++  fields:
++    zone_id:
++      name: Current zone ID
++      description: Current identifier of the heating zone.
++      required: true
++      example: "downstairs"
++      selector:
++        text:
++    new_zone_id:
++      name: New zone ID
++      description: New identifier. Spaces become underscores; must not contain /, + or #.
++      required: true
++      example: "1"
++      selector:
++        text:
+diff --git a/custom_components/hestia_scheduler/store.py b/custom_components/hestia_scheduler/store.py
+index 0d4fa0a..cd5ffb1 100644
+--- a/custom_components/hestia_scheduler/store.py
++++ b/custom_components/hestia_scheduler/store.py
+@@ -7,7 +7,7 @@ from __future__ import annotations
+ 
+ import logging
+ from collections import OrderedDict
+-from dataclasses import dataclass, field, asdict
++from dataclasses import dataclass, field, asdict, replace
+ from typing import Any, MutableMapping, cast
+ 
+ from homeassistant.core import HomeAssistant, callback
+@@ -334,6 +334,25 @@ class ScheduleStorage:
+         self.async_schedule_save()
+         return updated
+ 
++    @callback
++    def async_rename_zone(self, zone_id: str, new_zone_id: str) -> ZoneConfig:
++        """Change a zone's ID, keeping its schedule, thermal data and position."""
++        if zone_id not in self.zones:
++            raise KeyError(zone_id)
++        if new_zone_id in self.zones:
++            raise ValueError(f"Zone {new_zone_id!r} already exists")
++        renamed = replace(self.zones[zone_id], zone_id=new_zone_id)
++        items = [
++            (new_zone_id, renamed) if zid == zone_id else (zid, zone)
++            for zid, zone in self.zones.items()
++        ]
++        # Mutate in place so anything holding a reference to the mapping
++        # keeps seeing the current zones; rebuilding also keeps zone order.
++        self.zones.clear()
++        self.zones.update(items)
++        self.async_schedule_save()
++        return renamed
++
+     @callback
+     def async_delete_zone(self, zone_id: str) -> bool:
+         if zone_id not in self.zones:

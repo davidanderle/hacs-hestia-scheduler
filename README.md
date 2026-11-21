@@ -317,6 +317,19 @@ Copy `custom_components/hestia_scheduler/` into your HA config `custom_component
 
 Go to **Settings → Integrations → Hestia Scheduler → Configure** and choose **Add zone**.
 
+### Renaming a zone ID
+
+The zone **name** is just a label, but the zone **ID** is the key used in MQTT topics, service calls and the card config, and it can't be edited in the options flow (which would treat a changed ID as "remove zone + add zone" and lose the schedule and learned thermal data). To change it, call the `hestia_scheduler.rename_zone` action from **Developer Tools → Actions**:
+
+```yaml
+action: hestia_scheduler.rename_zone
+data:
+  zone_id: downstairs
+  new_zone_id: "1"
+```
+
+The schedule, learned thermal parameters, skipped/rolled-back slot history and the zone's entities (`entity_id`s and history) are kept, and the integration reloads itself. Afterwards, update anything of yours that used the old ID: automations calling this integration's actions, MQTT topics you match on explicitly, and a card's `zone_id` / `default_zone` option.
+
 ### Lovelace card setup
 
 The card resource is registered automatically by the integration. If needed, manually add `/hestia_scheduler/hestia-schedule-card.js` as a module in **Lovelace resources**.
@@ -342,11 +355,28 @@ Restart Mosquitto after editing.
 
 | Topic | Direction | Purpose |
 |-------|-----------|---------|
-| `hestia/scheduler/{zone}/preempt` | Server 1 → Server 2 | Pre-transition notification payload |
-| `hestia/scheduler/{zone}/preempt/response` | Server 2 → Server 1 | User response: `{"action": "skip"}` or `{"action": "proceed"}` |
-| `hestia/scheduler/{zone}/transition` | Server 1 → Server 2 | Post-transition event (includes rollback context) |
-| `hestia/scheduler/{zone}/rollback` | Server 2 → Server 1 | Rollback command: `{"action": "restore_previous"}` |
+| `hestia/scheduler/{zone_id}/preempt` | Server 1 → Server 2 | Pre-transition notification payload |
+| `hestia/scheduler/{zone_id}/preempt/response` | Server 2 → Server 1 | User response: `{"action": "skip"}` or `{"action": "proceed"}` |
+| `hestia/scheduler/{zone_id}/transition` | Server 1 → Server 2 | Post-transition event (includes rollback context) |
+| `hestia/scheduler/{zone_id}/rollback` | Server 2 → Server 1 | Rollback command: `{"action": "restore_previous"}` |
 | `hestia/scheduler/state` | Server 1 → Server 2 | Full retained schedule state |
+
+Every zone-specific payload identifies the zone the same way as the state message does: `zone_id` is the machine identifier (the same value as in the topic — use it for topics and notification tags) and `name` is the display name (use it in anything user-facing).
+
+**`preempt`**
+
+```json
+{"zone_id": "3", "name": "Study", "current_temp": 19.5, "current_preset": "home",
+ "next_temp": null, "next_preset": "away", "scheduled_time": "08:30", "deadline_seconds": 900}
+```
+
+**`transition`**
+
+```json
+{"zone_id": "3", "name": "Study", "event": "transition_executed", "user_responded": false,
+ "new_temp": null, "new_preset": "away", "previous_temp": null, "previous_preset": "home",
+ "rollback_available": true, "rollback_expires": "2026-01-01T14:30:00+00:00"}
+```
 
 ---
 
@@ -364,25 +394,25 @@ triggers:
 actions:
   - variables:
       data: "{{ trigger.payload | from_json }}"
-      zone: "{{ data.zone }}"
+      zone_id: "{{ data.zone_id }}"
+      zone_name: "{{ data.name }}"
       current_preset: "{{ data.current_preset | default('unknown') }}"
       next_preset: "{{ data.next_preset | default(none) }}"
       next_temp: "{{ data.next_temp | default(none) }}"
       scheduled_time: "{{ data.scheduled_time }}"
       deadline: "{{ data.deadline_seconds | int(60) }}"
       action_skip: HESTIA_PREEMPT_SKIP_{{ context.id }}
-      action_proceed: HESTIA_PREEMPT_PROCEED_{{ context.id }}
       target_label: >-
         {% if next_preset %}{{ next_preset }}{% else %}{{ next_temp }}°C{% endif
         %}
   - action: notify.all_phones
     data:
-      title: 🌡️ {{ zone | title }} schedule change
+      title: 🌡️ {{ zone_name }} schedule change
       message: >-
         Switching to '{{ target_label }}' at {{ scheduled_time }}. Cancel or it
         proceeds automatically.
       data:
-        tag: hestia_preempt_{{ zone }}
+        tag: hestia_preempt_{{ zone_id }}
         ttl: 0
         priority: high
         actions:
@@ -396,7 +426,7 @@ actions:
       - trigger: event
         event_type: mobile_app_notification_cleared
         event_data:
-          tag: hestia_preempt_{{ zone }}
+          tag: hestia_preempt_{{ zone_id }}
     timeout:
       seconds: "{{ deadline | int }}"
     continue_on_timeout: true
@@ -410,7 +440,7 @@ actions:
             'mobile_app_notification_action' %}skip{% else %}proceed{% endif %}
       - action: mqtt.publish
         data:
-          topic: hestia/scheduler/{{ zone }}/preempt/response
+          topic: hestia/scheduler/{{ zone_id }}/preempt/response
           payload: "{\"action\": \"{{ response }}\"}"
 mode: parallel
 max: 4
@@ -428,23 +458,25 @@ triggers:
 conditions:
   - condition: template
     value_template: >-
-      {% set d = trigger.payload | from_json %} {{ d.rollback_available |
-      default(false) and not d.user_responded | default(true) }}
+      {% set d = trigger.payload | from_json %}
+      {{ (d.rollback_available | default(false))
+         and not (d.user_responded | default(false)) }}
 actions:
   - variables:
       data: "{{ trigger.payload | from_json }}"
-      zone: "{{ data.zone }}"
+      zone_id: "{{ data.zone_id }}"
+      zone_name: "{{ data.name }}"
       new_preset: "{{ data.new_preset | default('unknown') }}"
       prev_preset: "{{ data.previous_preset | default('unknown') }}"
       action_restore: HESTIA_ROLLBACK_{{ context.id }}
   - action: notify.all_phones
     data:
-      title: 🌡️ {{ zone | title }} schedule change
+      title: 🌡️ {{ zone_name }} schedule change
       message: >-
         Switched from '{{ prev_preset }}' to '{{ new_preset }}'. Tap restore to
         undo.
       data:
-        tag: hestia_rollback_{{ zone }}
+        tag: hestia_rollback_{{ zone_id }}
         ttl: 0
         priority: high
         actions:
@@ -463,13 +495,14 @@ actions:
     then:
       - action: mqtt.publish
         data:
-          topic: hestia/scheduler/{{ zone }}/rollback
+          topic: hestia/scheduler/{{ zone_id }}/rollback
           payload: "{\"action\": \"restore_previous\"}"
       - action: notify.all_phones
         data:
-          message: "{{ zone | title }} schedule restored to {{ prev_preset }}."
+          title: 🌡️ {{ zone_name }} schedule restored
+          message: "{{ zone_name }} schedule restored to {{ prev_preset }}."
           data:
-            tag: hestia_rollback_{{ zone }}
+            tag: hestia_rollback_{{ zone_id }}
 mode: parallel
 max: 4
 ```
@@ -538,6 +571,7 @@ The integration creates two sensor entities per zone, visible under **Settings �
 | `hestia_scheduler.enable_zone` | Enable scheduling for a zone |
 | `hestia_scheduler.disable_zone` | Disable scheduling (heating continues but is not auto-controlled) |
 | `hestia_scheduler.skip_next_transition` | Skip the next scheduled transition (one-off manual override) |
+| `hestia_scheduler.rename_zone` | Change a zone's ID (`zone_id` → `new_zone_id`), keeping its schedule, learned thermal data and entities |
 
 ---
 

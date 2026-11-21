@@ -93,10 +93,10 @@ DEFAULT_ROLLBACK_WINDOW_FRACTION = 0.5  # rollback expires halfway to next slot
 # -------------------------------------------------------------------
 # MQTT topics
 # -------------------------------------------------------------------
-MQTT_TOPIC_PREEMPT = "hestia/scheduler/{zone}/preempt"
-MQTT_TOPIC_PREEMPT_RESPONSE = "hestia/scheduler/{zone}/preempt/response"
-MQTT_TOPIC_TRANSITION = "hestia/scheduler/{zone}/transition"
-MQTT_TOPIC_ROLLBACK = "hestia/scheduler/{zone}/rollback"
+MQTT_TOPIC_PREEMPT = "hestia/scheduler/{zone_id}/preempt"
+MQTT_TOPIC_PREEMPT_RESPONSE = "hestia/scheduler/{zone_id}/preempt/response"
+MQTT_TOPIC_TRANSITION = "hestia/scheduler/{zone_id}/transition"
+MQTT_TOPIC_ROLLBACK = "hestia/scheduler/{zone_id}/rollback"
 MQTT_TOPIC_STATE = "hestia/scheduler/state"
 
 # -------------------------------------------------------------------
@@ -106,6 +106,7 @@ SERVICE_SET_ZONE_SCHEDULE = "set_zone_schedule"
 SERVICE_ENABLE_ZONE = "enable_zone"
 SERVICE_DISABLE_ZONE = "disable_zone"
 SERVICE_SKIP_NEXT_TRANSITION = "skip_next_transition"
+SERVICE_RENAME_ZONE = "rename_zone"
 
 # -------------------------------------------------------------------
 # Attribute / data keys used in dicts across the integration

@@ -69,3 +69,26 @@ skip_next_transition:
       example: "downstairs"
       selector:
         text:
+
+rename_zone:
+  name: Rename Zone ID
+  description: >
+    Change the ID of a zone (the machine identifier used in MQTT topics,
+    service calls and the card config, not the display name). The schedule,
+    learned thermal data and entities are kept. Update any automations or
+    dashboards that refer to the old ID.
+  fields:
+    zone_id:
+      name: Current zone ID
+      description: Current identifier of the heating zone.
+      required: true
+      example: "downstairs"
+      selector:
+        text:
+    new_zone_id:
+      name: New zone ID
+      description: New identifier. Spaces become underscores; must not contain /, + or #.
+      required: true
+      example: "1"
+      selector:
+        text:

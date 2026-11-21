@@ -59,6 +59,16 @@ class MqttHandler:
         """
         self._rollback_callback = cb
 
+    def _zone_name(self, zone_id: str) -> str:
+        """Return the display name for a zone, falling back to its zone_id.
+
+        zone_id is a machine identifier (used in topics and tags) and may be
+        a plain number, so payloads also carry the name for anything
+        user-facing.
+        """
+        zone = self.store.async_get_zone(zone_id)
+        return zone.name if zone and zone.name else zone_id
+
     async def async_setup(self) -> None:
         """Subscribe to all relevant MQTT topics."""
         zones = self.store.async_get_all_zones()
@@ -74,8 +84,8 @@ class MqttHandler:
         if zone_id in self._subscribed_zones:
             return
         self._subscribed_zones.add(zone_id)
-        response_topic = MQTT_TOPIC_PREEMPT_RESPONSE.format(zone=zone_id)
-        rollback_topic = MQTT_TOPIC_ROLLBACK.format(zone=zone_id)
+        response_topic = MQTT_TOPIC_PREEMPT_RESPONSE.format(zone_id=zone_id)
+        rollback_topic = MQTT_TOPIC_ROLLBACK.format(zone_id=zone_id)
 
         @callback
         def _on_preempt_response(msg) -> None:
@@ -153,7 +163,8 @@ class MqttHandler:
           - user_responded: True if the user explicitly tapped a button
         """
         payload = {
-            "zone": zone_id,
+            "zone_id": zone_id,
+            "name": self._zone_name(zone_id),
             "current_temp": current_temp,
             "current_preset": current_preset,
             "next_temp": next_temp,
@@ -161,7 +172,7 @@ class MqttHandler:
             "scheduled_time": scheduled_time,
             "deadline_seconds": lead_seconds,
         }
-        topic = MQTT_TOPIC_PREEMPT.format(zone=zone_id)
+        topic = MQTT_TOPIC_PREEMPT.format(zone_id=zone_id)
         await async_publish(
             self.hass,
             topic,
@@ -229,9 +240,9 @@ class MqttHandler:
             }
 
         payload = {
-            "zone": zone_id,
+            "zone_id": zone_id,
+            "name": self._zone_name(zone_id),
             "event": "transition_executed",
-            "was_preemptable": True,
             "user_responded": user_responded,
             "new_temp": new_temp,
             "new_preset": new_preset,
@@ -240,7 +251,7 @@ class MqttHandler:
             "rollback_available": rollback_available,
             "rollback_expires": expires.isoformat() if expires else None,
         }
-        topic = MQTT_TOPIC_TRANSITION.format(zone=zone_id)
+        topic = MQTT_TOPIC_TRANSITION.format(zone_id=zone_id)
         await async_publish(
             self.hass,
             topic,

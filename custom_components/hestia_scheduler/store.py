@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import Any, MutableMapping, cast
 
 from homeassistant.core import HomeAssistant, callback
@@ -333,6 +333,25 @@ class ScheduleStorage:
         self.zones[zone_id] = updated
         self.async_schedule_save()
         return updated
+
+    @callback
+    def async_rename_zone(self, zone_id: str, new_zone_id: str) -> ZoneConfig:
+        """Change a zone's ID, keeping its schedule, thermal data and position."""
+        if zone_id not in self.zones:
+            raise KeyError(zone_id)
+        if new_zone_id in self.zones:
+            raise ValueError(f"Zone {new_zone_id!r} already exists")
+        renamed = replace(self.zones[zone_id], zone_id=new_zone_id)
+        items = [
+            (new_zone_id, renamed) if zid == zone_id else (zid, zone)
+            for zid, zone in self.zones.items()
+        ]
+        # Mutate in place so anything holding a reference to the mapping
+        # keeps seeing the current zones; rebuilding also keeps zone order.
+        self.zones.clear()
+        self.zones.update(items)
+        self.async_schedule_save()
+        return renamed
 
     @callback
     def async_delete_zone(self, zone_id: str) -> bool:

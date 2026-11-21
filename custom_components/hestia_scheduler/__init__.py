@@ -22,6 +22,7 @@ from .const import (
     SERVICE_ENABLE_ZONE,
     SERVICE_DISABLE_ZONE,
     SERVICE_SKIP_NEXT_TRANSITION,
+    SERVICE_RENAME_ZONE,
     WEEKDAYS,
     EVENT_ZONE_UPDATED,
 )
@@ -233,6 +234,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
         engine: SchedulerEngine = hass.data[DOMAIN]["engine"]
         await engine.async_skip_next_transition(call.data["zone_id"])
 
+    async def _svc_rename_zone(call) -> None:
+        await _async_rename_zone(hass, call.data["zone_id"], call.data["new_zone_id"])
+
     hass.services.async_register(
         DOMAIN, SERVICE_SET_ZONE_SCHEDULE, _svc_set_schedule,
         schema=vol.Schema({
@@ -253,7 +257,94 @@ def _async_register_services(hass: HomeAssistant) -> None:
         DOMAIN, SERVICE_SKIP_NEXT_TRANSITION, _svc_skip_next,
         schema=vol.Schema({vol.Required("zone_id"): cv.string}),
     )
+    hass.services.async_register(
+        DOMAIN, SERVICE_RENAME_ZONE, _svc_rename_zone,
+        schema=vol.Schema({
+            vol.Required("zone_id"): cv.string,
+            vol.Required("new_zone_id"): cv.string,
+        }),
+    )
     _LOGGER.debug("Hestia Scheduler services registered")
+
+
+async def _async_rename_zone(hass: HomeAssistant, old_id: str, new_id: str) -> None:
+    """Change a zone's ID everywhere it is persisted.
+
+    The ID is the key of the zone in the schedule store, in the config entry
+    (data and options), and in the unique IDs of the zone's sensors and the
+    identifiers of its device.  Renaming through the options flow would be
+    seen as "remove zone + add zone" and lose the schedule and learned
+    thermal data, so all of them are moved together here.
+    """
+    from homeassistant.exceptions import ServiceValidationError
+    from homeassistant.helpers import device_registry as dr, entity_registry as er
+
+    # Same normalisation as the config flow.
+    new_id = new_id.strip().lower().replace(" ", "_")
+    store = hass.data[DOMAIN]["store"]
+
+    if store.async_get_zone(old_id) is None:
+        raise ServiceValidationError(f"Zone {old_id!r} not found")
+    if not new_id or any(c in new_id for c in "/+#"):
+        # The ID is a level in the MQTT topics (hestia/scheduler/<id>/...).
+        raise ServiceValidationError(
+            f"Invalid zone ID {new_id!r}: must not be empty or contain '/', '+' or '#'"
+        )
+    if new_id == old_id:
+        return
+    if store.async_get_zone(new_id) is not None:
+        raise ServiceValidationError(f"Zone {new_id!r} already exists")
+
+    # 1. Schedule store (persisted immediately, before anything can reload).
+    store.async_rename_zone(old_id, new_id)
+    await store.async_save()
+
+    # 2. Entity / device registries, so the sensors keep their entity_ids,
+    #    history and customisations instead of being recreated.
+    ent_reg = er.async_get(hass)
+    for suffix in ("schedule", "preheat"):
+        entity_id = ent_reg.async_get_entity_id(
+            "sensor", DOMAIN, f"{DOMAIN}_{old_id}_{suffix}"
+        )
+        if entity_id:
+            ent_reg.async_update_entity(
+                entity_id, new_unique_id=f"{DOMAIN}_{new_id}_{suffix}"
+            )
+    dev_reg = dr.async_get(hass)
+    device = dev_reg.async_get_device(identifiers={(DOMAIN, old_id)})
+    if device:
+        dev_reg.async_update_device(device.id, new_identifiers={(DOMAIN, new_id)})
+
+    # 3. Config entry.  Zones created in the options flow / config flow are
+    #    listed in entry.data and/or entry.options and would otherwise be
+    #    re-created under the old ID on the next start.
+    entries = hass.config_entries.async_entries(DOMAIN)
+    if not entries:
+        return
+    entry = entries[0]
+    data, options = dict(entry.data), dict(entry.options)
+    changed = False
+    for conf in (data, options):
+        zones = conf.get(CONF_ZONES)
+        if not zones:
+            continue
+        renamed = [
+            {**z, ATTR_ZONE_ID: new_id} if z.get(ATTR_ZONE_ID) == old_id else z
+            for z in zones
+        ]
+        if renamed != zones:
+            conf[CONF_ZONES] = renamed
+            changed = True
+
+    _LOGGER.info("Zone %s renamed to %s", old_id, new_id)
+
+    # Updating the entry makes the update listener reload it; otherwise
+    # reload explicitly so timers, MQTT subscriptions and sensors pick up
+    # the new ID.
+    if not (changed and hass.config_entries.async_update_entry(
+        entry, data=data, options=options
+    )):
+        await hass.config_entries.async_reload(entry.entry_id)
 
 
 # ---------------------------------------------------------------------------
