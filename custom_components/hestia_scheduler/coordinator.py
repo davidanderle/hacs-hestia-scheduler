@@ -25,6 +25,7 @@ from .const import (
     ATTR_BASE_HEAT_RATE,
     ATTR_SLOT_OVERRIDES,
     ATTR_HOLIDAY_TARGET,
+    ATTR_PRESET_TEMPERATURES,
     EVENT_ZONE_CREATED,
     EVENT_ZONE_UPDATED,
     EVENT_ZONE_REMOVED,
@@ -98,8 +99,15 @@ class HestiaSchedulerCoordinator(DataUpdateCoordinator):
         result[ATTR_SLOT_OVERRIDES] = zone.slot_overrides
         result[ATTR_HOLIDAY_TARGET] = zone.holiday_target.to_dict()
         if self.engine:
+            self.engine.thermal.update_preset_cache(zone.zone_id)
+            result[ATTR_PRESET_TEMPERATURES] = (
+                self.engine.thermal.get_preset_cache(zone.zone_id)
+            )
             result["holiday"] = self.engine.get_holiday_zone_state(zone.zone_id)
         else:
+            result[ATTR_PRESET_TEMPERATURES] = dict(
+                zone.thermal.preset_temperatures
+            )
             result["holiday"] = {"active": False}
         return result
 
@@ -183,13 +191,14 @@ class HestiaSchedulerCoordinator(DataUpdateCoordinator):
             zone_id, preset=preset, temperature=temperature
         )
         async_dispatcher_send(self.hass, EVENT_ZONE_UPDATED, zone_id)
-        if self.engine:
-            self.hass.async_create_task(
-                self.engine.async_reload_zone(zone_id, force_apply=True)
-            )
-        if self.mqtt:
-            self.hass.async_create_task(self.mqtt.async_publish_holiday_state())
-            self.hass.async_create_task(self.mqtt.async_publish_state())
+
+        async def _async_apply_and_publish() -> None:
+            if self.engine:
+                await self.engine.async_reload_zone(zone_id, force_apply=True)
+            if self.mqtt:
+                await self.mqtt.async_publish_state()
+
+        self.hass.async_create_task(_async_apply_and_publish())
         return self._zone_to_api(zone)
 
     @callback

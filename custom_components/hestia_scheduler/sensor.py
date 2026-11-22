@@ -8,7 +8,7 @@ status, enabled state).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
@@ -36,6 +36,16 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _holiday_attributes(engine, zone_id: str) -> dict:
+    """Return the common schedule-sensor Holiday mode attributes."""
+    state = engine.get_holiday_zone_state(zone_id) if engine else {"active": False}
+    return {
+        "holiday_active": state.get("active", False),
+        "holiday_until": state.get("until"),
+        "holiday_target": state.get("target"),
+    }
 
 
 async def async_setup_entry(
@@ -131,15 +141,9 @@ class HestiaZoneSensor(SensorEntity):
 
         if not zone.enabled:
             self._attr_native_value = "disabled"
-            holiday_state = (
-                engine.get_holiday_zone_state(self._zone_id)
-                if engine else {"active": False}
-            )
             self._attr_extra_state_attributes = {
                 "enabled": False,
-                "holiday_active": holiday_state.get("active", False),
-                "holiday_until": holiday_state.get("until"),
-                "holiday_target": holiday_state.get("target"),
+                **_holiday_attributes(engine, self._zone_id),
             }
             return
 
@@ -155,10 +159,7 @@ class HestiaZoneSensor(SensorEntity):
             self._attr_native_value = "idle"
 
         attrs: dict = {"enabled": True, "preheating": preheating}
-        holiday_state = engine.get_holiday_zone_state(self._zone_id) if engine else {"active": False}
-        attrs["holiday_active"] = holiday_state.get("active", False)
-        attrs["holiday_until"] = holiday_state.get("until")
-        attrs["holiday_target"] = holiday_state.get("target")
+        attrs.update(_holiday_attributes(engine, self._zone_id))
         if next_s is not None:
             attrs["next_preset"] = next_s.preset
             attrs["next_temperature"] = next_s.temperature
@@ -306,12 +307,13 @@ class HestiaPreHeatSensor(SensorEntity):
         # Compute lead time if we have enough info
         lead_minutes = None
         preheat_start = None
-        if resolved_target is not None and current_temp is not None:
-            lead_minutes = timer._calc_lead_minutes(
-                next_slot, holiday_return=timer.next_is_holiday_return
+        if timer.preheat_dt is not None and next_dt is not None:
+            preheat_start = timer.preheat_dt
+            lead_minutes = max(
+                0, round((next_dt - timer.preheat_dt).total_seconds() / 60)
             )
-            if next_dt is not None and lead_minutes > 0:
-                preheat_start = next_dt - timedelta(minutes=lead_minutes)
+        elif resolved_target is not None and current_temp is not None:
+            lead_minutes = 0
 
         # Compute adjusted heat rate for display
         adjusted_rate = None

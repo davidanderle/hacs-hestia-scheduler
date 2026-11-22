@@ -23,8 +23,7 @@ from .const import (
     MQTT_TOPIC_TRANSITION,
     MQTT_TOPIC_ROLLBACK,
     MQTT_TOPIC_STATE,
-    MQTT_TOPIC_HOLIDAY_SET,
-    MQTT_TOPIC_HOLIDAY_STATE,
+    MQTT_TOPIC_HOLIDAY_MODE,
     WEEKDAYS,
 )
 
@@ -99,7 +98,7 @@ class MqttHandler:
             self.hass.async_create_task(self._async_process_holiday_request(payload))
 
         self._subscriptions.append(
-            await async_subscribe(self.hass, MQTT_TOPIC_HOLIDAY_SET, _on_holiday_set)
+            await async_subscribe(self.hass, MQTT_TOPIC_HOLIDAY_MODE, _on_holiday_set)
         )
         zones = self.store.async_get_all_zones()
         for zone in zones:
@@ -127,7 +126,7 @@ class MqttHandler:
                 "until": None,
                 "error": str(err),
             }
-        await self.async_publish_holiday_state()
+        await self.async_publish_state()
 
     async def async_subscribe_zone(self, zone_id: str) -> None:
         """Subscribe to MQTT topics for a newly added zone."""
@@ -340,7 +339,9 @@ class MqttHandler:
             payload["zones"].append(zone_data)
 
         if self._holiday_state_provider:
-            payload["holiday"] = self._holiday_state_provider()
+            holiday = dict(self._holiday_state_provider())
+            holiday["last_request"] = self._last_holiday_request
+            payload["holiday"] = holiday
 
         await async_publish(
             self.hass,
@@ -350,20 +351,3 @@ class MqttHandler:
             retain=True,
         )
         _LOGGER.debug("Schedule state published to MQTT")
-
-    async def async_publish_holiday_state(self) -> None:
-        """Publish the compact retained Holiday mode state used by Kobold."""
-        payload = (
-            self._holiday_state_provider()
-            if self._holiday_state_provider else {"active": False, "zones": {}}
-        )
-        payload = dict(payload)
-        payload["last_request"] = self._last_holiday_request
-        payload["published_at"] = dt_util.utcnow().isoformat()
-        await async_publish(
-            self.hass,
-            MQTT_TOPIC_HOLIDAY_STATE,
-            json.dumps(payload),
-            qos=0,
-            retain=True,
-        )

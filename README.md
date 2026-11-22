@@ -29,6 +29,7 @@ The entire repo was vibe-coded in about 8 hours with Cursor following strict ins
 - **Learning thermostat (pre-heat)** — Automatically starts heating early enough to reach the target temperature by the scheduled time, accounting for inside and outside temperature and per-zone learned heating rates.
 - **Preemptive notifications** — Option to send actionable mobile notifications before configured transitions (e.g. switching to "away") so you can cancel the change if plans change. Excellent when you decide to work from home on days when simply can't get out of the bed on time...
 - **Rollback notifications** — If a preemptive notification times out without a response, a follow-up notification lets you restore the previous state after the fact. This way even if you sleep through the schedule change, you can quickly restore the previous slot.
+- **Holiday mode** — Hold every enabled zone at its own Away preset or direct temperature, then use uncapped learned pre-heating to reach the scheduled target by the selected return time
 - **Restart-safe** — Detects missed transitions on startup and applies the correct schedule state
 - **HA native backups** — All schedule data is stored in `.storage/hestia_scheduler.storage` and included automatically in Home Assistant backups
 
@@ -47,6 +48,18 @@ This integration is designed around a **standalone heating controller** that doe
 | **Connectivity** | Operates independently — heating continues even if Server 2, Wi-Fi, or the internet goes down | Connects to Server 1 via an MQTT bridge |
 
 **The key design principle:** Server 1 is fully autonomous. If Server 2 goes offline, the worst that happens is you don't receive phone notifications — the schedule, PID control, and pre-heating all continue running on Server 1 without interruption.
+
+### Single-server use
+
+Hestia Scheduler, its card, Holiday mode, restart recovery and return pre-heating all work on one Home Assistant server. The supplied Kobold Holiday package can also run on that same server: keep the MQTT sensor and automations, publish `hestia/holiday_mode` to the server's local broker, and omit the Mosquitto bridge configuration entirely. The package deliberately uses the same MQTT request/state contract in both layouts; a separate single-server package is not provided.
+
+The important limitations are:
+
+- MQTT remains a dependency. Holiday requests from the example phone automation still make a local MQTT round trip instead of calling `hestia_scheduler.set_holiday` directly.
+- The one-server layout removes fault isolation. If that Home Assistant instance or its broker is unavailable, scheduling, heating control and notifications are unavailable together; the two-server design keeps the heating controller autonomous when the main UI/notification server fails.
+- `notify.all_phones`, `zone.home`, the dashboard path and the package entity IDs are installation-specific and must exist on the same server or be changed.
+- No bridge lines are required on one server. Adding a self-bridge can duplicate messages and should be avoided.
+- Existing preemption and rollback examples also use MQTT. They work against the local broker but retain the same local-loopback dependency.
 
 ```mermaid
 flowchart TB
@@ -207,6 +220,12 @@ show_current_temp: true        # show thermometer + temperature in tabs (default
 zone_id: downstairs            # restrict card to a single zone (omit for all zones with tabs)
 ```
 
+### Holiday mode
+
+Each zone has a **Holiday mode** target, defaulting to the Away preset. Disabled zones are left untouched. Use the preset/temperature control at the bottom of the card to change a zone's Holiday target. The date/time picker beside **Heating Schedule** defaults to tomorrow at 18:00; while Holiday mode is active it shows the current end time so it can be extended or shortened. The active banner keeps a separate **Cancel** button.
+
+Return dates must be in the future and no more than 60 days away. The phone/MQTT parser also accepts `3d`, `2w`, `36h`, `28/11`, `28/11 18:00` and `28/11/2026 18:00`. Date-only and day/week replies use 18:00. Normal schedule pre-heating retains its four-hour cap; the Holiday return estimate is uncapped and receives a 15% safety margin.
+
 ---
 
 ## Preemptive Action (Bell Icon)
@@ -347,6 +366,7 @@ topic hestia/scheduler/+/preempt/response out 0
 topic hestia/scheduler/+/transition in 0
 topic hestia/scheduler/+/rollback out 0
 topic hestia/scheduler/state in 0
+topic hestia/holiday_mode out 0
 ```
 
 Restart Mosquitto after editing.
@@ -359,9 +379,17 @@ Restart Mosquitto after editing.
 | `hestia/scheduler/{zone_id}/preempt/response` | Server 2 → Server 1 | User response: `{"action": "skip"}` or `{"action": "proceed"}` |
 | `hestia/scheduler/{zone_id}/transition` | Server 1 → Server 2 | Post-transition event (includes rollback context) |
 | `hestia/scheduler/{zone_id}/rollback` | Server 2 → Server 1 | Rollback command: `{"action": "restore_previous"}` |
-| `hestia/scheduler/state` | Server 1 → Server 2 | Full retained schedule state |
+| `hestia/holiday_mode` | Server 2 → Server 1 | Set/clear Holiday mode; accepts `request_id` plus `text`, ISO `until`, or `action: clear` |
+| `hestia/scheduler/state` | Server 1 → Server 2 | Full retained schedule state, including the `holiday` block and its latest correlated request result |
 
 Every zone-specific payload identifies the zone the same way as the state message does: `zone_id` is the machine identifier (the same value as in the topic — use it for topics and notification tags) and `name` is the display name (use it in anything user-facing).
+
+Holiday requests are correlated through `holiday.last_request` in the retained `hestia/scheduler/state` payload:
+
+```json
+{"holiday": {"active": true, "until": "2026-11-28T18:00:00+00:00",
+ "last_request": {"request_id": "abc-123", "ok": true, "until": "2026-11-28T18:00:00+00:00", "error": null}}}
+```
 
 **`preempt`**
 
@@ -572,6 +600,9 @@ The integration creates two sensor entities per zone, visible under **Settings �
 | `hestia_scheduler.disable_zone` | Disable scheduling (heating continues but is not auto-controlled) |
 | `hestia_scheduler.skip_next_transition` | Skip the next scheduled transition (one-off manual override) |
 | `hestia_scheduler.rename_zone` | Change a zone's ID (`zone_id` → `new_zone_id`), keeping its schedule, learned thermal data and entities |
+| `hestia_scheduler.set_holiday` | Set Holiday mode with `until` or `until_text`; the optional response is `{ok, until, error}` and invalid input is reported as a validation error |
+| `hestia_scheduler.clear_holiday` | Cancel Holiday mode and immediately resume normal schedules |
+| `hestia_scheduler.set_zone_holiday_target` | Set one zone's Holiday preset or direct temperature |
 
 ---
 

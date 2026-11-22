@@ -6,7 +6,8 @@ from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import CoreState, HomeAssistant, callback, Event
+from homeassistant.core import CoreState, HomeAssistant, SupportsResponse, callback, Event
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 import homeassistant.util.dt as dt_util
 
@@ -101,7 +102,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return  # entry was unloaded / reloaded before HA finished starting
         await engine.async_start()
         await mqtt.async_publish_state()
-        await mqtt.async_publish_holiday_state()
         for zone in store.async_get_all_zones():
             async_dispatcher_send(hass, EVENT_ZONE_UPDATED, zone.zone_id)
 
@@ -242,8 +242,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
     async def _svc_rename_zone(call) -> None:
         await _async_rename_zone(hass, call.data["zone_id"], call.data["new_zone_id"])
 
-    async def _svc_set_holiday(call) -> None:
+    async def _svc_set_holiday(call) -> dict:
         engine: SchedulerEngine = hass.data[DOMAIN]["engine"]
+        if "until" not in call.data and "until_text" not in call.data:
+            raise ServiceValidationError("Provide either until or until_text")
         payload = {
             key: call.data[key]
             for key in ("until", "until_text")
@@ -251,19 +253,36 @@ def _async_register_services(hass: HomeAssistant) -> None:
         }
         if "until_text" in payload:
             payload["text"] = payload.pop("until_text")
-        await engine.async_handle_holiday_request(payload, source="service")
+        try:
+            until = await engine.async_handle_holiday_request(
+                payload, source="service"
+            )
+        except ValueError as err:
+            raise ServiceValidationError(
+                f"Invalid Holiday return date/time: {err}"
+            ) from err
+        return {
+            "ok": True,
+            "until": until.isoformat() if until else None,
+            "error": None,
+        }
 
     async def _svc_clear_holiday(call) -> None:
         engine: SchedulerEngine = hass.data[DOMAIN]["engine"]
         await engine.async_clear_holiday()
 
     async def _svc_set_zone_holiday_target(call) -> None:
+        if "preset" not in call.data and "temperature" not in call.data:
+            raise ServiceValidationError("Provide either preset or temperature")
         coordinator = _get_coordinator()
-        coordinator.async_set_zone_holiday_target(
-            call.data["zone_id"],
-            preset=call.data.get("preset"),
-            temperature=call.data.get("temperature"),
-        )
+        try:
+            coordinator.async_set_zone_holiday_target(
+                call.data["zone_id"],
+                preset=call.data.get("preset"),
+                temperature=call.data.get("temperature"),
+            )
+        except (KeyError, ValueError) as err:
+            raise ServiceValidationError(str(err)) from err
 
     hass.services.async_register(
         DOMAIN, SERVICE_SET_ZONE_SCHEDULE, _svc_set_schedule,
@@ -294,12 +313,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_SET_HOLIDAY, _svc_set_holiday,
-        schema=vol.Schema(
-            vol.Any(
-                {vol.Required("until"): cv.string},
-                {vol.Required("until_text"): cv.string},
-            )
-        ),
+        schema=vol.Schema({
+            vol.Exclusive("until", "holiday_until"): cv.string,
+            vol.Exclusive("until_text", "holiday_until"): cv.string,
+        }),
+        supports_response=SupportsResponse.OPTIONAL,
     )
     hass.services.async_register(
         DOMAIN, SERVICE_CLEAR_HOLIDAY, _svc_clear_holiday,
@@ -307,18 +325,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_SET_ZONE_HOLIDAY_TARGET, _svc_set_zone_holiday_target,
-        schema=vol.Schema(
-            vol.Any(
-                {
-                    vol.Required("zone_id"): cv.string,
-                    vol.Required("preset"): vol.In(VALID_PRESETS),
-                },
-                {
-                    vol.Required("zone_id"): cv.string,
-                    vol.Required("temperature"): vol.Coerce(float),
-                },
-            )
-        ),
+        schema=vol.Schema({
+            vol.Required("zone_id"): cv.string,
+            vol.Exclusive("preset", "holiday_target"): vol.In(VALID_PRESETS),
+            vol.Exclusive("temperature", "holiday_target"): vol.Coerce(float),
+        }),
     )
     _LOGGER.debug("Hestia Scheduler services registered")
 

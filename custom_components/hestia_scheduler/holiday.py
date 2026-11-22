@@ -22,6 +22,26 @@ class HolidayParseError(ValueError):
     """Raised when a holiday reply cannot be interpreted safely."""
 
 
+def validate_until(
+    until: datetime,
+    now: datetime,
+    *,
+    max_days: int = MAX_HOLIDAY_DAYS,
+) -> datetime:
+    """Validate and return a timezone-aware Holiday mode end time.
+
+    All entry points (text parser, ISO service/MQTT requests and the card) use
+    this one validation path so they expose the same limits and error text.
+    """
+    if until.tzinfo is None or now.tzinfo is None:
+        raise HolidayParseError("The return date/time must include a timezone")
+    if until <= now:
+        raise HolidayParseError("The return date/time must be in the future")
+    if until > now + timedelta(days=max_days):
+        raise HolidayParseError(f"The return date/time must be within {max_days} days")
+    return until
+
+
 def parse_holiday_reply(
     text: str,
     now: datetime,
@@ -83,11 +103,7 @@ def parse_holiday_reply(
             except ValueError as err:
                 raise HolidayParseError("The return date is invalid") from err
 
-    if until <= now:
-        raise HolidayParseError("The return date/time must be in the future")
-    if until > now + timedelta(days=max_days):
-        raise HolidayParseError(f"The return date/time must be within {max_days} days")
-    return until
+    return validate_until(until, now, max_days=max_days)
 
 
 def holiday_next_transition(

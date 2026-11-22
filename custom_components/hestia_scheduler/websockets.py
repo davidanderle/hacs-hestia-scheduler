@@ -41,6 +41,7 @@ WS_TYPE_DELETE_ZONE = f"{DOMAIN}/delete_zone"
 WS_TYPE_ENABLE_ZONE = f"{DOMAIN}/enable_zone"
 WS_TYPE_SUBSCRIBE = f"{DOMAIN}/subscribe"
 WS_TYPE_SET_HOLIDAY_TARGET = f"{DOMAIN}/set_holiday_target"
+WS_TYPE_SET_HOLIDAY = f"{DOMAIN}/set_holiday"
 WS_TYPE_CLEAR_HOLIDAY = f"{DOMAIN}/clear_holiday"
 
 
@@ -189,6 +190,36 @@ def ws_set_holiday_target(hass: HomeAssistant, connection, msg) -> None:
     connection.send_result(msg["id"], zone)
 
 
+@decorators.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_SET_HOLIDAY,
+        vol.Exclusive("until", "holiday_until"): str,
+        vol.Exclusive("until_text", "holiday_until"): str,
+    }
+)
+@decorators.async_response
+async def ws_set_holiday(hass: HomeAssistant, connection, msg) -> None:
+    """Enable or adjust Holiday mode from the schedule card."""
+    if "until" not in msg and "until_text" not in msg:
+        connection.send_error(
+            msg["id"], "invalid_data", "Provide either until or until_text"
+        )
+        return
+    payload = {key: msg[key] for key in ("until", "until_text") if key in msg}
+    if "until_text" in payload:
+        payload["text"] = payload.pop("until_text")
+    engine = hass.data[DOMAIN]["engine"]
+    try:
+        until = await engine.async_handle_holiday_request(payload, source="card")
+    except ValueError as err:
+        connection.send_error(msg["id"], "invalid_data", str(err))
+        return
+    connection.send_result(
+        msg["id"],
+        {"ok": True, "until": until.isoformat() if until else None, "error": None},
+    )
+
+
 @decorators.websocket_command({vol.Required("type"): WS_TYPE_CLEAR_HOLIDAY})
 @decorators.async_response
 async def ws_clear_holiday(hass: HomeAssistant, connection, msg) -> None:
@@ -252,6 +283,7 @@ async def async_register_websockets(hass: HomeAssistant) -> None:
         ws_delete_zone,
         ws_enable_zone,
         ws_set_holiday_target,
+        ws_set_holiday,
         ws_clear_holiday,
         ws_subscribe,
     ):

@@ -8,10 +8,12 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field, asdict, replace
+from datetime import datetime
 from typing import Any, MutableMapping, cast
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
+import homeassistant.util.dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -117,22 +119,36 @@ class HeatUpEvent:
 class HolidayConfig:
     """Persisted whole-house holiday period."""
 
-    until: str
-    set_at: str
+    until: datetime
+    set_at: datetime
     source: str = "service"
+
+    def is_active(self, now: datetime) -> bool:
+        """Return whether this holiday period contains ``now``."""
+        return (
+            dt_util.as_utc(self.set_at)
+            <= dt_util.as_utc(now)
+            < dt_util.as_utc(self.until)
+        )
 
     def to_dict(self) -> dict:
         return {
-            ATTR_HOLIDAY_UNTIL: self.until,
-            ATTR_HOLIDAY_SET_AT: self.set_at,
+            ATTR_HOLIDAY_UNTIL: self.until.isoformat(),
+            ATTR_HOLIDAY_SET_AT: self.set_at.isoformat(),
             ATTR_HOLIDAY_SOURCE: self.source,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "HolidayConfig":
+        until = dt_util.parse_datetime(data[ATTR_HOLIDAY_UNTIL])
+        set_at = dt_util.parse_datetime(data[ATTR_HOLIDAY_SET_AT])
+        if until is None or set_at is None:
+            raise ValueError("Invalid persisted Holiday mode date/time")
+        if until.tzinfo is None or set_at.tzinfo is None:
+            raise ValueError("Persisted Holiday mode date/time has no timezone")
         return cls(
-            until=data[ATTR_HOLIDAY_UNTIL],
-            set_at=data[ATTR_HOLIDAY_SET_AT],
+            until=dt_util.as_utc(until),
+            set_at=dt_util.as_utc(set_at),
             source=data.get(ATTR_HOLIDAY_SOURCE, "service"),
         )
 
@@ -489,7 +505,9 @@ class ScheduleStorage:
     # ------------------------------------------------------------------
 
     @callback
-    def async_set_holiday(self, until: str, set_at: str, source: str) -> None:
+    def async_set_holiday(
+        self, until: datetime, set_at: datetime, source: str
+    ) -> None:
         self.holiday = HolidayConfig(until=until, set_at=set_at, source=source)
         self.async_schedule_save()
 

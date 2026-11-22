@@ -99,8 +99,7 @@ MQTT_TOPIC_PREEMPT_RESPONSE = "hestia/scheduler/{zone_id}/preempt/response"
 MQTT_TOPIC_TRANSITION = "hestia/scheduler/{zone_id}/transition"
 MQTT_TOPIC_ROLLBACK = "hestia/scheduler/{zone_id}/rollback"
 MQTT_TOPIC_STATE = "hestia/scheduler/state"
-MQTT_TOPIC_HOLIDAY_SET = "hestia/scheduler/holiday/set"
-MQTT_TOPIC_HOLIDAY_STATE = "hestia/scheduler/holiday/state"
+MQTT_TOPIC_HOLIDAY_MODE = "hestia/holiday_mode"
 
 # -------------------------------------------------------------------
 # Services
