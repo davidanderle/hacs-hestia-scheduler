@@ -59,6 +59,7 @@ EVENT_SCHEDULE_UPDATED = "hestia_scheduler_schedule_updated"
 EVENT_TRANSITION_EXECUTED = "hestia_scheduler_transition_executed"
 EVENT_PREHEAT_UPDATE = "hestia_scheduler_preheat_update"
 EVENT_STARTED = "hestia_scheduler_started"
+EVENT_HOLIDAY_UPDATED = "hestia_scheduler_holiday_updated"
 
 # -------------------------------------------------------------------
 # Config / Options keys
@@ -98,6 +99,8 @@ MQTT_TOPIC_PREEMPT_RESPONSE = "hestia/scheduler/{zone_id}/preempt/response"
 MQTT_TOPIC_TRANSITION = "hestia/scheduler/{zone_id}/transition"
 MQTT_TOPIC_ROLLBACK = "hestia/scheduler/{zone_id}/rollback"
 MQTT_TOPIC_STATE = "hestia/scheduler/state"
+MQTT_TOPIC_HOLIDAY_SET = "hestia/scheduler/holiday/set"
+MQTT_TOPIC_HOLIDAY_STATE = "hestia/scheduler/holiday/state"
 
 # -------------------------------------------------------------------
 # Services
@@ -107,6 +110,9 @@ SERVICE_ENABLE_ZONE = "enable_zone"
 SERVICE_DISABLE_ZONE = "disable_zone"
 SERVICE_SKIP_NEXT_TRANSITION = "skip_next_transition"
 SERVICE_RENAME_ZONE = "rename_zone"
+SERVICE_SET_HOLIDAY = "set_holiday"
+SERVICE_CLEAR_HOLIDAY = "clear_holiday"
+SERVICE_SET_ZONE_HOLIDAY_TARGET = "set_zone_holiday_target"
 
 # -------------------------------------------------------------------
 # Attribute / data keys used in dicts across the integration
@@ -143,3 +149,10 @@ ATTR_PREVIOUS_PRESET = "previous_preset"
 # Slot override tracking (skipped/rolled-back occurrences)
 # Key: "day:HH:MM", value: {"at": ISO timestamp, "restored_preset": str|None, "restored_temp": float|None}
 ATTR_SLOT_OVERRIDES = "slot_overrides"
+
+# Holiday mode state
+ATTR_HOLIDAY = "holiday"
+ATTR_HOLIDAY_TARGET = "holiday_target"
+ATTR_HOLIDAY_UNTIL = "until"
+ATTR_HOLIDAY_SET_AT = "set_at"
+ATTR_HOLIDAY_SOURCE = "source"

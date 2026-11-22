@@ -41,11 +41,21 @@ from .const import (
     PYTHON_WEEKDAY_MAP,
     WEEKDAYS,
     DEFAULT_MIN_LEAD_MINUTES,
+    DEFAULT_MAX_LEAD_MINUTES,
     EVENT_TRANSITION_EXECUTED,
     EVENT_SCHEDULE_UPDATED,
     EVENT_PREHEAT_UPDATE,
     EVENT_STARTED,
+    EVENT_HOLIDAY_UPDATED,
     PREHEAT_TARGET_TOLERANCE,
+)
+
+from .holiday import (
+    HOLIDAY_RETURN_SAFETY_FACTOR,
+    MAX_HOLIDAY_DAYS,
+    HolidayParseError,
+    holiday_next_transition,
+    parse_holiday_reply,
 )
 
 if TYPE_CHECKING:
@@ -200,6 +210,41 @@ class ZoneTimer:
         self.next_slot: "ScheduleSlot | None" = None
         self.next_transition_dt: datetime | None = None
         self.preheating: bool = False
+        self.next_is_holiday_return: bool = False
+
+    def _holiday_window(self) -> tuple[datetime, datetime] | None:
+        holiday = self.store.holiday
+        if holiday is None:
+            return None
+        set_at = dt_util.parse_datetime(holiday.set_at)
+        until = dt_util.parse_datetime(holiday.until)
+        if set_at is None or until is None:
+            return None
+        return dt_util.as_utc(set_at), dt_util.as_utc(until)
+
+    def _holiday_active(self, now: datetime) -> bool:
+        window = self._holiday_window()
+        return bool(window and window[0] <= now < window[1])
+
+    def _effective_active(
+        self, zone: "ZoneConfig", now: datetime
+    ) -> tuple["ScheduleSlot | None", int, datetime | None]:
+        if self._holiday_active(now):
+            window = self._holiday_window()
+            return zone.holiday_target, -1, window[0] if window else now
+        return find_active_slot_with_start(zone, now)
+
+    def _effective_next(
+        self, zone: "ZoneConfig", now: datetime
+    ) -> tuple["ScheduleSlot | None", datetime | None, bool]:
+        window = self._holiday_window()
+        if window and window[0] <= now < window[1]:
+            slot, transition = holiday_next_transition(
+                zone, window[1], find_active_slot
+            )
+            return slot, transition, True
+        slot, transition = find_next_slot(zone, now)
+        return slot, transition, False
 
     # ------------------------------------------------------------------
     # Start / stop
@@ -225,7 +270,7 @@ class ZoneTimer:
         self.thermal.update_preset_cache(self.zone_id)
 
         now = dt_util.utcnow()
-        active_slot, _, active_start = find_active_slot_with_start(zone, now)
+        active_slot, _, active_start = self._effective_active(zone, now)
 
         if shutdown_time is not None:
             await self._async_recover_from_shutdown(
@@ -251,7 +296,7 @@ class ZoneTimer:
         if self._preempt_task and not self._preempt_task.done():
             self._preempt_task.cancel()
 
-    async def async_reload(self) -> None:
+    async def async_reload(self, force_apply: bool = False) -> None:
         """Reload when schedule config changes."""
         previous_active = self.active_slot
         was_preheating = self.preheating
@@ -260,7 +305,7 @@ class ZoneTimer:
             # The pre-heat will be re-evaluated (and restarted if still due)
             # by _async_schedule_next; discard the partial learning sample.
             self._reset_preheat_state()
-        await self.async_start(previous_active=previous_active)
+        await self.async_start(previous_active=None if force_apply else previous_active)
 
     # ------------------------------------------------------------------
     # Restart recovery
@@ -274,7 +319,7 @@ class ZoneTimer:
         current_active_slot: "ScheduleSlot | None",
         current_active_start: datetime | None = None,
     ) -> None:
-        slot_at_shutdown, _ = find_active_slot(zone, shutdown_time)
+        slot_at_shutdown, _, _ = self._effective_active(zone, shutdown_time)
         if current_active_slot is None:
             return
 
@@ -332,9 +377,10 @@ class ZoneTimer:
             return
 
         now = dt_util.utcnow()
-        next_slot, next_dt = find_next_slot(zone, now)
+        next_slot, next_dt, is_holiday_return = self._effective_next(zone, now)
         self.next_slot = next_slot
         self.next_transition_dt = next_dt
+        self.next_is_holiday_return = is_holiday_return
         if next_slot is None or next_dt is None:
             _LOGGER.info("Zone %s: no next slot found, scheduler idle", self.zone_id)
             return
@@ -347,7 +393,9 @@ class ZoneTimer:
         )
 
         # Calculate pre-heat lead time (never pre-heat a slot that will be skipped)
-        lead_minutes = 0 if self._manual_skip else self._calc_lead_minutes(next_slot)
+        lead_minutes = 0 if self._manual_skip else self._calc_lead_minutes(
+            next_slot, holiday_return=is_holiday_return
+        )
         preheat_dt = next_dt - timedelta(minutes=lead_minutes) if lead_minutes > 0 else None
 
         if preheat_dt is not None and preheat_dt <= now + timedelta(seconds=30):
@@ -414,7 +462,11 @@ class ZoneTimer:
         # Set the main transition timer
         @callback
         def _on_transition(_now):
-            self.hass.async_create_task(self._async_on_transition(next_slot, next_dt))
+            self.hass.async_create_task(
+                self._async_on_transition(
+                    next_slot, next_dt, holiday_return=is_holiday_return
+                )
+            )
 
         self._main_timer_cancel = async_track_point_in_time(
             self.hass, _on_transition, next_dt
@@ -532,7 +584,10 @@ class ZoneTimer:
     # ------------------------------------------------------------------
 
     async def _async_on_transition(
-        self, slot: "ScheduleSlot", slot_dt: datetime
+        self,
+        slot: "ScheduleSlot",
+        slot_dt: datetime,
+        holiday_return: bool = False,
     ) -> None:
         """Handle a scheduled transition time arriving."""
         _LOGGER.info(
@@ -628,11 +683,20 @@ class ZoneTimer:
 
         # Apply the slot action
         await self._async_apply_slot(slot, is_recovery=False)
-        # Clear any prior override for this slot (it fired normally this week)
-        self.store.async_clear_slot_override(
-            self.zone_id, self._override_key(slot_dt, slot.time)
-        )
+        # A holiday return happens at an arbitrary date/time, not at the
+        # weekly slot's own key, so it must not alter rollback/skip markers.
+        if not holiday_return:
+            self.store.async_clear_slot_override(
+                self.zone_id, self._override_key(slot_dt, slot.time)
+            )
         async_dispatcher_send(self.hass, EVENT_TRANSITION_EXECUTED, self.zone_id)
+
+        if holiday_return:
+            self.store.async_clear_holiday()
+            await self.store.async_save()
+            async_dispatcher_send(self.hass, EVENT_HOLIDAY_UPDATED, self.zone_id)
+            await self.mqtt.async_publish_holiday_state()
+            await self.mqtt.async_publish_state()
 
         # Publish transition event (for rollback notifications if preemptable)
         if slot.preemptable:
@@ -843,7 +907,9 @@ class ZoneTimer:
         self.preheating = False
         async_dispatcher_send(self.hass, EVENT_PREHEAT_UPDATE, self.zone_id)
 
-    def _calc_lead_minutes(self, slot: "ScheduleSlot") -> int:
+    def _calc_lead_minutes(
+        self, slot: "ScheduleSlot", holiday_return: bool = False
+    ) -> int:
         """Return pre-heat lead minutes for a slot (0 if no heating needed)."""
         if self._climate_is_off():
             return 0
@@ -860,9 +926,22 @@ class ZoneTimer:
             return DEFAULT_MIN_LEAD_MINUTES
 
         outside = self.thermal.get_outside_temp(self.zone_id)
-        return self.thermal.estimate_lead_minutes(
-            self.zone_id, current, target, outside
+        lead = self.thermal.estimate_lead_minutes(
+            self.zone_id,
+            current,
+            target,
+            outside,
+            max_minutes=None if holiday_return else DEFAULT_MAX_LEAD_MINUTES,
         )
+        if holiday_return and lead > 0:
+            lead = int(round(lead * HOLIDAY_RETURN_SAFETY_FACTOR))
+            if lead > 48 * 60:
+                _LOGGER.warning(
+                    "Zone %s: holiday return lead estimate is unusually long (%d min)",
+                    self.zone_id,
+                    lead,
+                )
+        return lead
 
     # ------------------------------------------------------------------
     # Temperature-driven pre-heat re-evaluation
@@ -902,7 +981,9 @@ class ZoneTimer:
         if now >= self.next_transition_dt:
             return
 
-        lead_minutes = self._calc_lead_minutes(self.next_slot)
+        lead_minutes = self._calc_lead_minutes(
+            self.next_slot, holiday_return=self.next_is_holiday_return
+        )
         if lead_minutes <= 0:
             self._cancel_preheat_timer()
             return
@@ -1021,9 +1102,12 @@ class SchedulerEngine:
         self.thermal = thermal
         self.mqtt = mqtt
         self._timers: dict[str, ZoneTimer] = {}
+        self._holiday_expiry_cancel = None
 
         # Register rollback callback on mqtt handler
         mqtt.set_rollback_callback(self._async_rollback)
+        mqtt.set_holiday_callback(self.async_handle_holiday_request)
+        mqtt.set_holiday_state_provider(self.get_holiday_state)
 
     async def _async_rollback(
         self, zone_id: str, temperature: float | None, preset: str | None
@@ -1034,6 +1118,13 @@ class SchedulerEngine:
 
     async def async_start(self) -> None:
         """Start all zone timers, with restart recovery."""
+        holiday = self.store.holiday
+        if holiday:
+            until = dt_util.parse_datetime(holiday.until)
+            if until is None or dt_util.as_utc(until) <= dt_util.utcnow():
+                self.store.async_clear_holiday()
+                await self.store.async_save()
+
         shutdown_time_str = self.store.async_get_shutdown_time()
         shutdown_time: datetime | None = None
         if shutdown_time_str:
@@ -1044,6 +1135,7 @@ class SchedulerEngine:
 
         for zone in self.store.async_get_all_zones():
             await self._async_start_zone(zone.zone_id, shutdown_time)
+        self._arm_holiday_expiry_fallback()
 
     async def _async_start_zone(
         self, zone_id: str, shutdown_time: datetime | None = None
@@ -1060,6 +1152,7 @@ class SchedulerEngine:
         for timer in self._timers.values():
             await timer.async_stop()
         self._timers.clear()
+        self._cancel_holiday_expiry_fallback()
 
     async def async_add_zone(self, zone_id: str) -> None:
         """Start timer for a newly created zone."""
@@ -1071,11 +1164,11 @@ class SchedulerEngine:
         if timer:
             await timer.async_stop()
 
-    async def async_reload_zone(self, zone_id: str) -> None:
+    async def async_reload_zone(self, zone_id: str, force_apply: bool = False) -> None:
         """Reload a zone's timer after schedule changes."""
         timer = self._timers.get(zone_id)
         if timer:
-            await timer.async_reload()
+            await timer.async_reload(force_apply=force_apply)
 
     async def async_enable_zone(self, zone_id: str) -> None:
         _LOGGER.debug("Zone %s: enabled, reloading schedule", zone_id)
@@ -1101,3 +1194,167 @@ class SchedulerEngine:
 
     def get_zone_timer(self, zone_id: str) -> ZoneTimer | None:
         return self._timers.get(zone_id)
+
+    # ------------------------------------------------------------------
+    # Holiday mode
+    # ------------------------------------------------------------------
+
+    async def async_handle_holiday_request(
+        self, payload: dict, source: str = "mqtt"
+    ) -> datetime | None:
+        """Parse and apply a Holiday mode MQTT/service request."""
+        if payload.get("action") == "clear":
+            await self.async_clear_holiday()
+            return None
+
+        now_local = dt_util.now()
+        if payload.get("text") is not None:
+            until = parse_holiday_reply(str(payload["text"]), now_local)
+            if until is None:
+                return None
+        elif payload.get("until") is not None:
+            until = dt_util.parse_datetime(str(payload["until"]))
+            if until is None:
+                raise HolidayParseError("The return date/time is invalid")
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+        else:
+            raise HolidayParseError("The request must contain text, until, or action: clear")
+
+        until_utc = dt_util.as_utc(until)
+        now_utc = dt_util.utcnow()
+        if until_utc <= now_utc:
+            raise HolidayParseError("The return date/time must be in the future")
+        if until_utc > now_utc + timedelta(days=MAX_HOLIDAY_DAYS):
+            raise HolidayParseError(
+                f"The return date/time must be within {MAX_HOLIDAY_DAYS} days"
+            )
+        await self.async_set_holiday(until_utc, source=source)
+        return until_utc
+
+    async def async_set_holiday(self, until: datetime, source: str = "service") -> None:
+        """Enable Holiday mode and immediately apply each enabled zone target."""
+        now = dt_util.utcnow()
+        self.store.async_set_holiday(
+            until=dt_util.as_utc(until).isoformat(),
+            set_at=now.isoformat(),
+            source=source,
+        )
+        await self.store.async_save()
+        self.mqtt.clear_rollback_contexts()
+        for zone in self.store.async_get_all_zones():
+            if zone.enabled:
+                await self.async_reload_zone(zone.zone_id, force_apply=True)
+            async_dispatcher_send(self.hass, EVENT_HOLIDAY_UPDATED, zone.zone_id)
+        self._arm_holiday_expiry_fallback()
+        await self.mqtt.async_publish_holiday_state()
+        await self.mqtt.async_publish_state()
+
+    async def async_clear_holiday(self) -> None:
+        """Disable Holiday mode and re-apply the normal active schedule."""
+        had_holiday = self.store.holiday is not None
+        self._cancel_holiday_expiry_fallback()
+        self.store.async_clear_holiday()
+        if had_holiday:
+            await self.store.async_save()
+            for zone in self.store.async_get_all_zones():
+                if zone.enabled:
+                    await self.async_reload_zone(zone.zone_id, force_apply=True)
+                async_dispatcher_send(self.hass, EVENT_HOLIDAY_UPDATED, zone.zone_id)
+        await self.mqtt.async_publish_holiday_state()
+        await self.mqtt.async_publish_state()
+
+    def get_holiday_zone_state(self, zone_id: str) -> dict:
+        """Return frontend/MQTT Holiday mode details for one zone."""
+        zone = self.store.async_get_zone(zone_id)
+        holiday = self.store.holiday
+        if zone is None or holiday is None:
+            return {"active": False}
+        until = dt_util.parse_datetime(holiday.until)
+        set_at = dt_util.parse_datetime(holiday.set_at)
+        if until is None or set_at is None:
+            return {"active": False}
+        until_utc = dt_util.as_utc(until)
+        active = dt_util.as_utc(set_at) <= dt_util.utcnow() < until_utc
+        state: dict = {
+            "active": active,
+            "affected": active and zone.enabled,
+            "until": dt_util.as_local(until_utc).isoformat(),
+            "set_at": dt_util.as_local(dt_util.as_utc(set_at)).isoformat(),
+            "source": holiday.source,
+            "target": zone.holiday_target.to_dict(),
+        }
+        if not active or not zone.enabled:
+            return state
+
+        return_slot, _ = holiday_next_transition(zone, until_utc, find_active_slot)
+        if return_slot is not None:
+            state["return_target"] = return_slot.to_dict()
+        timer = self._timers.get(zone_id)
+        if timer and timer.next_is_holiday_return and timer.next_slot is not None:
+            lead = timer._calc_lead_minutes(
+                timer.next_slot, holiday_return=True
+            )
+            if lead > 0:
+                start = until_utc - timedelta(minutes=lead)
+                state["return_preheat_start"] = dt_util.as_local(
+                    max(dt_util.utcnow(), start)
+                ).isoformat()
+            state["preheating"] = timer.preheating
+        return state
+
+    def get_holiday_state(self) -> dict:
+        """Return whole-house Holiday mode state for MQTT."""
+        holiday = self.store.holiday
+        if holiday is None:
+            return {"active": False, "zones": {}}
+        zones = {
+            zone.zone_id: self.get_holiday_zone_state(zone.zone_id)
+            for zone in self.store.async_get_all_zones()
+        }
+        until = dt_util.parse_datetime(holiday.until)
+        set_at = dt_util.parse_datetime(holiday.set_at)
+        active = bool(
+            until and set_at
+            and dt_util.as_utc(set_at) <= dt_util.utcnow() < dt_util.as_utc(until)
+        )
+        return {
+            "active": active,
+            "until": holiday.until,
+            "set_at": holiday.set_at,
+            "source": holiday.source,
+            "zones": zones,
+        }
+
+    def _cancel_holiday_expiry_fallback(self) -> None:
+        if self._holiday_expiry_cancel:
+            self._holiday_expiry_cancel()
+            self._holiday_expiry_cancel = None
+
+    def _arm_holiday_expiry_fallback(self) -> None:
+        """Guarantee expiry even when no enabled zone has a schedule.
+
+        Zone return timers normally clear the persisted mode at ``until``.
+        This five-second fallback handles an empty schedule without racing the
+        per-zone transitions or discarding their heat-up samples.
+        """
+        self._cancel_holiday_expiry_fallback()
+        holiday = self.store.holiday
+        if holiday is None:
+            return
+        until = dt_util.parse_datetime(holiday.until)
+        if until is None:
+            return
+        expiry = dt_util.as_utc(until) + timedelta(seconds=5)
+        if expiry <= dt_util.utcnow():
+            self.hass.async_create_task(self.async_clear_holiday())
+            return
+
+        @callback
+        def _on_expiry(_now):
+            self._holiday_expiry_cancel = None
+            self.hass.async_create_task(self.async_clear_holiday())
+
+        self._holiday_expiry_cancel = async_track_point_in_time(
+            self.hass, _on_expiry, expiry
+        )

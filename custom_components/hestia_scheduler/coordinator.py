@@ -24,6 +24,7 @@ from .const import (
     ATTR_THERMAL,
     ATTR_BASE_HEAT_RATE,
     ATTR_SLOT_OVERRIDES,
+    ATTR_HOLIDAY_TARGET,
     EVENT_ZONE_CREATED,
     EVENT_ZONE_UPDATED,
     EVENT_ZONE_REMOVED,
@@ -95,6 +96,11 @@ class HestiaSchedulerCoordinator(DataUpdateCoordinator):
         for day in WEEKDAYS:
             result[ATTR_DAYS][day] = [s.to_dict() for s in zone.days.get(day, [])]
         result[ATTR_SLOT_OVERRIDES] = zone.slot_overrides
+        result[ATTR_HOLIDAY_TARGET] = zone.holiday_target.to_dict()
+        if self.engine:
+            result["holiday"] = self.engine.get_holiday_zone_state(zone.zone_id)
+        else:
+            result["holiday"] = {"active": False}
         return result
 
     def _get_current_temp(self, zone: "ZoneConfig") -> float | None:
@@ -163,6 +169,27 @@ class HestiaSchedulerCoordinator(DataUpdateCoordinator):
             self.hass.async_create_task(self.mqtt.async_publish_state())
 
         _LOGGER.debug("Schedule updated for zone %s day %s", zone_id, day)
+        return self._zone_to_api(zone)
+
+    @callback
+    def async_set_zone_holiday_target(
+        self,
+        zone_id: str,
+        *,
+        preset: str | None = None,
+        temperature: float | None = None,
+    ) -> dict:
+        zone = self.store.async_set_zone_holiday_target(
+            zone_id, preset=preset, temperature=temperature
+        )
+        async_dispatcher_send(self.hass, EVENT_ZONE_UPDATED, zone_id)
+        if self.engine:
+            self.hass.async_create_task(
+                self.engine.async_reload_zone(zone_id, force_apply=True)
+            )
+        if self.mqtt:
+            self.hass.async_create_task(self.mqtt.async_publish_holiday_state())
+            self.hass.async_create_task(self.mqtt.async_publish_state())
         return self._zone_to_api(zone)
 
     @callback

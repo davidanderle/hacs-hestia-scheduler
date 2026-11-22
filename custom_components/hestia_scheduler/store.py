@@ -43,6 +43,11 @@ from .const import (
     ATTR_SHUTDOWN_TIME,
     ATTR_ZONES,
     ATTR_SLOT_OVERRIDES,
+    ATTR_HOLIDAY,
+    ATTR_HOLIDAY_TARGET,
+    ATTR_HOLIDAY_UNTIL,
+    ATTR_HOLIDAY_SET_AT,
+    ATTR_HOLIDAY_SOURCE,
     DEFAULT_PREEMPT_LEAD_MINUTES,
     MAX_HEAT_HISTORY,
 )
@@ -109,6 +114,30 @@ class HeatUpEvent:
 
 
 @dataclass
+class HolidayConfig:
+    """Persisted whole-house holiday period."""
+
+    until: str
+    set_at: str
+    source: str = "service"
+
+    def to_dict(self) -> dict:
+        return {
+            ATTR_HOLIDAY_UNTIL: self.until,
+            ATTR_HOLIDAY_SET_AT: self.set_at,
+            ATTR_HOLIDAY_SOURCE: self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "HolidayConfig":
+        return cls(
+            until=data[ATTR_HOLIDAY_UNTIL],
+            set_at=data[ATTR_HOLIDAY_SET_AT],
+            source=data.get(ATTR_HOLIDAY_SOURCE, "service"),
+        )
+
+
+@dataclass
 class ZoneThermalParams:
     """Per-zone thermal model parameters."""
     base_heat_rate: float = DEFAULT_HEAT_RATE_UNDERFLOOR   # C/hr
@@ -153,6 +182,9 @@ class ZoneConfig:
     # Tracks slots that were skipped or rolled back this week.
     # Key: "day:HH:MM", value: {"at": ISO timestamp, "restored_preset": str|None, "restored_temp": float|None}
     slot_overrides: dict[str, dict] = field(default_factory=dict)
+    holiday_target: ScheduleSlot = field(
+        default_factory=lambda: ScheduleSlot(time="00:00", preset="away")
+    )
 
     def __post_init__(self):
         # Ensure all weekdays are present
@@ -172,6 +204,7 @@ class ZoneConfig:
             },
             ATTR_THERMAL: self.thermal.to_dict(),
             ATTR_SLOT_OVERRIDES: self.slot_overrides,
+            ATTR_HOLIDAY_TARGET: self.holiday_target.to_dict(),
         }
 
     @classmethod
@@ -188,6 +221,12 @@ class ZoneConfig:
             days=days,
             thermal=thermal,
             slot_overrides=data.get(ATTR_SLOT_OVERRIDES, {}),
+            holiday_target=ScheduleSlot.from_dict(
+                data.get(
+                    ATTR_HOLIDAY_TARGET,
+                    {ATTR_TIME: "00:00", ATTR_PRESET: "away"},
+                )
+            ),
         )
 
 
@@ -253,6 +292,7 @@ class ScheduleStorage:
         self.hass = hass
         self.zones: MutableMapping[str, ZoneConfig] = OrderedDict()
         self.shutdown_time: str | None = None
+        self.holiday: HolidayConfig | None = None
         self._store = _MigratableStore(hass, STORAGE_VERSION, STORAGE_KEY)
 
     async def async_load(self) -> None:
@@ -269,6 +309,12 @@ class ScheduleStorage:
                     _LOGGER.error("Failed to load zone %s: %s", zone_data.get(ATTR_ZONE_ID), err)
 
             self.shutdown_time = data.get(ATTR_SHUTDOWN_TIME)
+            holiday_data = data.get(ATTR_HOLIDAY)
+            if holiday_data:
+                try:
+                    self.holiday = HolidayConfig.from_dict(holiday_data)
+                except (KeyError, TypeError, ValueError) as err:
+                    _LOGGER.error("Failed to load holiday state: %s", err)
 
         self.zones = zones
         _LOGGER.debug("Loaded %d zones from storage", len(self.zones))
@@ -287,11 +333,14 @@ class ScheduleStorage:
         }
         if self.shutdown_time:
             data[ATTR_SHUTDOWN_TIME] = self.shutdown_time
+        if self.holiday:
+            data[ATTR_HOLIDAY] = self.holiday.to_dict()
         return data
 
     async def async_delete(self) -> None:
         _LOGGER.info("Removing all Hestia Scheduler data")
         self.zones = OrderedDict()
+        self.holiday = None
         await self._store.async_remove()
 
     # ------------------------------------------------------------------
@@ -330,6 +379,26 @@ class ScheduleStorage:
         zone_dict = zone.to_dict()
         zone_dict[ATTR_DAYS][day] = _normalise_slots(slots)
         updated = ZoneConfig.from_dict(zone_dict)
+        self.zones[zone_id] = updated
+        self.async_schedule_save()
+        return updated
+
+    @callback
+    def async_set_zone_holiday_target(
+        self,
+        zone_id: str,
+        *,
+        preset: str | None = None,
+        temperature: float | None = None,
+    ) -> ZoneConfig:
+        """Set the target used by an enabled zone during holiday mode."""
+        target = ScheduleSlot(
+            time="00:00",
+            preset=preset,
+            temperature=float(temperature) if temperature is not None else None,
+        )
+        zone = self.zones[zone_id]
+        updated = replace(zone, holiday_target=target)
         self.zones[zone_id] = updated
         self.async_schedule_save()
         return updated
@@ -413,6 +482,21 @@ class ScheduleStorage:
             return
         if key in zone.slot_overrides:
             del zone.slot_overrides[key]
+            self.async_schedule_save()
+
+    # ------------------------------------------------------------------
+    # Holiday mode
+    # ------------------------------------------------------------------
+
+    @callback
+    def async_set_holiday(self, until: str, set_at: str, source: str) -> None:
+        self.holiday = HolidayConfig(until=until, set_at=set_at, source=source)
+        self.async_schedule_save()
+
+    @callback
+    def async_clear_holiday(self) -> None:
+        if self.holiday is not None:
+            self.holiday = None
             self.async_schedule_save()
 
     # ------------------------------------------------------------------

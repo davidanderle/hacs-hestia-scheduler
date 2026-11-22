@@ -23,6 +23,8 @@ from .const import (
     MQTT_TOPIC_TRANSITION,
     MQTT_TOPIC_ROLLBACK,
     MQTT_TOPIC_STATE,
+    MQTT_TOPIC_HOLIDAY_SET,
+    MQTT_TOPIC_HOLIDAY_STATE,
     WEEKDAYS,
 )
 
@@ -49,6 +51,9 @@ class MqttHandler:
         self._rollback_contexts: dict[str, dict] = {}
         # Callback provided by scheduler engine for rollback execution
         self._rollback_callback: Callable[[str, float | None, str | None], Any] | None = None
+        self._holiday_callback: Callable[[dict, str], Any] | None = None
+        self._holiday_state_provider: Callable[[], dict] | None = None
+        self._last_holiday_request: dict | None = None
 
     def set_rollback_callback(
         self, cb: Callable[[str, float | None, str | None], Any]
@@ -58,6 +63,18 @@ class MqttHandler:
         Signature: cb(zone_id, temperature, preset)
         """
         self._rollback_callback = cb
+
+    def set_holiday_callback(self, cb: Callable[[dict, str], Any]) -> None:
+        """Register the engine callback that applies holiday requests."""
+        self._holiday_callback = cb
+
+    def set_holiday_state_provider(self, cb: Callable[[], dict]) -> None:
+        """Register a callback that builds the retained holiday state."""
+        self._holiday_state_provider = cb
+
+    def clear_rollback_contexts(self) -> None:
+        """Holiday mode supersedes pending transition rollback windows."""
+        self._rollback_contexts.clear()
 
     def _zone_name(self, zone_id: str) -> str:
         """Return the display name for a zone, falling back to its zone_id.
@@ -71,10 +88,46 @@ class MqttHandler:
 
     async def async_setup(self) -> None:
         """Subscribe to all relevant MQTT topics."""
+        @callback
+        def _on_holiday_set(msg) -> None:
+            try:
+                payload = json.loads(msg.payload)
+                if not isinstance(payload, dict):
+                    raise ValueError
+            except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+                payload = {}
+            self.hass.async_create_task(self._async_process_holiday_request(payload))
+
+        self._subscriptions.append(
+            await async_subscribe(self.hass, MQTT_TOPIC_HOLIDAY_SET, _on_holiday_set)
+        )
         zones = self.store.async_get_all_zones()
         for zone in zones:
             await self._async_subscribe_zone(zone.zone_id)
         _LOGGER.debug("MQTT handler subscribed for %d zones", len(zones))
+
+    async def _async_process_holiday_request(self, payload: dict) -> None:
+        """Apply a request and expose its result on the retained state topic."""
+        request_id = str(payload.get("request_id") or "")
+        try:
+            if self._holiday_callback is None:
+                raise RuntimeError("Holiday mode is not ready")
+            until = await self._holiday_callback(payload, "mqtt")
+            self._last_holiday_request = {
+                "request_id": request_id,
+                "ok": True,
+                "until": until.isoformat() if until else None,
+                "error": None,
+            }
+        except Exception as err:
+            _LOGGER.warning("Holiday request %s rejected: %s", request_id, err)
+            self._last_holiday_request = {
+                "request_id": request_id,
+                "ok": False,
+                "until": None,
+                "error": str(err),
+            }
+        await self.async_publish_holiday_state()
 
     async def async_subscribe_zone(self, zone_id: str) -> None:
         """Subscribe to MQTT topics for a newly added zone."""
@@ -279,11 +332,15 @@ class MqttHandler:
                 "climate_entity": zone.climate_entity,
                 "enabled": zone.enabled,
                 "days": {},
+                "holiday_target": zone.holiday_target.to_dict(),
             }
             for day in WEEKDAYS:
                 slots = zone.days.get(day, [])
                 zone_data["days"][day] = [s.to_dict() for s in slots]
             payload["zones"].append(zone_data)
+
+        if self._holiday_state_provider:
+            payload["holiday"] = self._holiday_state_provider()
 
         await async_publish(
             self.hass,
@@ -293,3 +350,20 @@ class MqttHandler:
             retain=True,
         )
         _LOGGER.debug("Schedule state published to MQTT")
+
+    async def async_publish_holiday_state(self) -> None:
+        """Publish the compact retained Holiday mode state used by Kobold."""
+        payload = (
+            self._holiday_state_provider()
+            if self._holiday_state_provider else {"active": False, "zones": {}}
+        )
+        payload = dict(payload)
+        payload["last_request"] = self._last_holiday_request
+        payload["published_at"] = dt_util.utcnow().isoformat()
+        await async_publish(
+            self.hass,
+            MQTT_TOPIC_HOLIDAY_STATE,
+            json.dumps(payload),
+            qos=0,
+            retain=True,
+        )

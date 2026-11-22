@@ -18,11 +18,13 @@ from .const import (
     EVENT_ZONE_REMOVED,
     EVENT_SCHEDULE_UPDATED,
     EVENT_TRANSITION_EXECUTED,
+    EVENT_HOLIDAY_UPDATED,
     ATTR_ZONE_ID,
     ATTR_ZONE_NAME,
     ATTR_CLIMATE_ENTITY,
     ATTR_ENABLED,
     ATTR_DAYS,
+    VALID_PRESETS,
 )
 
 if TYPE_CHECKING:
@@ -38,6 +40,8 @@ WS_TYPE_CREATE_ZONE = f"{DOMAIN}/create_zone"
 WS_TYPE_DELETE_ZONE = f"{DOMAIN}/delete_zone"
 WS_TYPE_ENABLE_ZONE = f"{DOMAIN}/enable_zone"
 WS_TYPE_SUBSCRIBE = f"{DOMAIN}/subscribe"
+WS_TYPE_SET_HOLIDAY_TARGET = f"{DOMAIN}/set_holiday_target"
+WS_TYPE_CLEAR_HOLIDAY = f"{DOMAIN}/clear_holiday"
 
 
 def _get_coordinator(hass: HomeAssistant) -> "HestiaSchedulerCoordinator":
@@ -158,6 +162,42 @@ def ws_enable_zone(hass: HomeAssistant, connection, msg) -> None:
     connection.send_result(msg["id"], zone)
 
 
+@callback
+@decorators.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_SET_HOLIDAY_TARGET,
+        vol.Required(ATTR_ZONE_ID): str,
+        vol.Exclusive("preset", "target"): vol.In(VALID_PRESETS),
+        vol.Exclusive("temperature", "target"): vol.Coerce(float),
+    }
+)
+def ws_set_holiday_target(hass: HomeAssistant, connection, msg) -> None:
+    """Update one zone's Holiday mode preset/temperature."""
+    if "preset" not in msg and "temperature" not in msg:
+        connection.send_error(msg["id"], "invalid_data", "preset or temperature is required")
+        return
+    coordinator = _get_coordinator(hass)
+    try:
+        zone = coordinator.async_set_zone_holiday_target(
+            msg[ATTR_ZONE_ID],
+            preset=msg.get("preset"),
+            temperature=msg.get("temperature"),
+        )
+    except (KeyError, ValueError) as err:
+        connection.send_error(msg["id"], "invalid_data", str(err))
+        return
+    connection.send_result(msg["id"], zone)
+
+
+@decorators.websocket_command({vol.Required("type"): WS_TYPE_CLEAR_HOLIDAY})
+@decorators.async_response
+async def ws_clear_holiday(hass: HomeAssistant, connection, msg) -> None:
+    """Cancel Holiday mode from the card banner."""
+    engine = hass.data[DOMAIN]["engine"]
+    await engine.async_clear_holiday()
+    connection.send_result(msg["id"], {"success": True})
+
+
 @decorators.websocket_command(
     {vol.Required("type"): WS_TYPE_SUBSCRIBE}
 )
@@ -184,6 +224,7 @@ async def ws_subscribe(hass: HomeAssistant, connection, msg) -> None:
         EVENT_ZONE_REMOVED,
         EVENT_SCHEDULE_UPDATED,
         EVENT_TRANSITION_EXECUTED,
+        EVENT_HOLIDAY_UPDATED,
     ):
         listeners.append(
             async_dispatcher_connect(hass, event, _make_handler(event))
@@ -210,6 +251,8 @@ async def async_register_websockets(hass: HomeAssistant) -> None:
         ws_create_zone,
         ws_delete_zone,
         ws_enable_zone,
+        ws_set_holiday_target,
+        ws_clear_holiday,
         ws_subscribe,
     ):
         async_register_command(hass, handler)

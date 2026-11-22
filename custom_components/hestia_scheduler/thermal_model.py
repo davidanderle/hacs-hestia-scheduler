@@ -74,12 +74,14 @@ class ThermalModel:
         current_temp: float,
         target_temp: float,
         outside_temp: float | None = None,
+        max_minutes: int | None = DEFAULT_MAX_LEAD_MINUTES,
     ) -> int:
         """Return how many minutes before scheduled time to start heating.
 
         Returns 0 if the room is already at or above target (no pre-heating
-        needed).  Returns a value in [DEFAULT_MIN_LEAD_MINUTES,
-        DEFAULT_MAX_LEAD_MINUTES].
+        needed).  Normal scheduling uses DEFAULT_MAX_LEAD_MINUTES.  Passing
+        ``max_minutes=None`` leaves the estimate uncapped for a Holiday mode
+        return, where the return datetime itself bounds how early heat starts.
         """
         if current_temp >= target_temp:
             return 0
@@ -95,7 +97,9 @@ class ThermalModel:
         delta = target_temp - current_temp
         lead = (delta / adjusted_rate) * 60.0  # minutes
 
-        lead = max(DEFAULT_MIN_LEAD_MINUTES, min(DEFAULT_MAX_LEAD_MINUTES, lead))
+        lead = max(DEFAULT_MIN_LEAD_MINUTES, lead)
+        if max_minutes is not None:
+            lead = min(max_minutes, lead)
         result = int(round(lead))
         _LOGGER.debug(
             "Zone %s: lead estimate = %d min (Δ%.1f°C, rate=%.3f°C/hr, outside=%.1f°C)",

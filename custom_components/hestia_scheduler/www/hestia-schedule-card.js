@@ -36,6 +36,30 @@ function minutesToTime(m) {
 function todayWeekday() {
   return {0:"sun",1:"mon",2:"tue",3:"wed",4:"thu",5:"fri",6:"sat"}[new Date().getDay()];
 }
+function dateForWeekday(day) {
+  const now = new Date();
+  const mondayOffset = (now.getDay() + 6) % 7;
+  const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - mondayOffset);
+  return new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + WEEKDAYS.indexOf(day));
+}
+function holidayAffectsSegment(day, startMinutes, endMinutes, holiday) {
+  if (!holiday?.active || !holiday?.affected || !holiday.set_at || !holiday.until) return false;
+  const base = dateForWeekday(day);
+  const start = new Date(base);
+  start.setMinutes(startMinutes);
+  const end = new Date(base);
+  end.setMinutes(endMinutes);
+  const holidayStart = new Date(holiday.set_at);
+  const holidayEnd = new Date(holiday.until);
+  return !isNaN(holidayStart) && !isNaN(holidayEnd) && start < holidayEnd && end > holidayStart;
+}
+function formatHolidayDateTime(value) {
+  const d = new Date(value);
+  if (isNaN(d)) return value ?? "";
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "short", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+  }).format(d);
+}
 function lerp(v, lo, hi, oLo, oHi) {
   return oLo + ((v - lo) / (hi - lo)) * (oHi - oLo);
 }
@@ -103,6 +127,13 @@ class HestiaScheduleDayRow extends HTMLElement {
   set zone(z) { this._zone = z; this._render(); }
   set isToday(v) { this._isToday = v; this._render(); this._startNowTimer(); }
   set disabled(v) { this._disabled = v; this._render(); }
+  set holiday(v) {
+    const key = v ? `${v.active}|${v.set_at}|${v.until}|${JSON.stringify(v.target)}` : "";
+    if (key === this._holidayKey) return;
+    this._holidayKey = key;
+    this._holiday = v;
+    this._render();
+  }
   set preheat(p) {
     const key = p ? `${p.active}|${p.startMinutes}|${p.nextSlotMinutes}|${p.isLive}` : "";
     if (key === this._preheatKey) return;
@@ -159,8 +190,18 @@ class HestiaScheduleDayRow extends HTMLElement {
           const color = slotColor(s.slot);
           const overrideKey = `${this._day}:${s.slot.time}`;
           const override = overrides[overrideKey];
+          const holidayAffected = holidayAffectsSegment(
+            this._day, s.startMinutes, s.endMinutes, this._holiday
+          );
           let lbl, bell;
-          if (override) {
+          if (holidayAffected) {
+            const holidayTarget = this._holiday?.target ?? this._zone.holiday_target ?? {preset:"away"};
+            const holidayColor = "#CE93D8";
+            lbl = holidayTarget.preset
+              ? presetIcon(holidayTarget.preset, 15, holidayColor)
+              : `<span style="font-size:.72em;font-weight:600;color:${holidayColor};">${Number(holidayTarget.temperature).toFixed(1)}°C</span>`;
+            bell = "";
+          } else if (override) {
             const restoredPreset = override.restored_preset;
             const restoredTemp = override.restored_temp;
             const overrideColor = "var(--error-color,#ef5350)";
@@ -490,7 +531,9 @@ class HestiaScheduleCard extends HTMLElement {
         ? `<ha-icon icon="mdi:thermometer" style="--mdc-icon-size:16px;vertical-align:middle;color:${tempColor};"></ha-icon> <span style="font-size:.85em;color:${tempColor};">${z.current_temperature.toFixed(1)}°C</span>` : "";
       const disabledBadge = !z.enabled
         ? `<span style="font-size:.65em;color:var(--error-color,#ef5350);font-weight:600;text-transform:uppercase;letter-spacing:.03em;">off</span>` : "";
-      const curPreset = activePresetNow(z);
+      const curPreset = z.holiday?.active && z.holiday?.affected
+        ? z.holiday.target?.preset
+        : activePresetNow(z);
       const presetIconColor = active ? "rgba(255,255,255,.85)" : "var(--secondary-text-color)";
       const curPresetIcon = curPreset ? presetIcon(curPreset, 16, presetIconColor) : "";
 
@@ -525,11 +568,34 @@ class HestiaScheduleCard extends HTMLElement {
       ? `<button data-zone="${zone.zone_id}" data-enabled="${zone.enabled}" style="font-size:.8em;padding:4px 12px;border:1px solid var(--divider-color,#555);border-radius:6px;background:none;cursor:pointer;color:var(--primary-text-color);">${zone.enabled?"Disable zone":"Enable zone"}</button>`
       : "";
 
+    const holiday = zone?.holiday;
+    const holidayBanner = holiday?.active
+      ? `<div style="margin:4px 16px 6px;padding:8px 10px;border-radius:8px;background:rgba(156,39,176,.14);border:1px solid rgba(206,147,216,.45);display:flex;align-items:center;gap:8px;font-size:.82em;">
+          <ha-icon icon="mdi:palm-tree" style="--mdc-icon-size:18px;color:#CE93D8;"></ha-icon>
+          <span style="flex:1;"><strong>Holiday until ${formatHolidayDateTime(holiday.until)}</strong>${holiday.return_preheat_start ? ` · return pre-heat from ~${formatHolidayDateTime(holiday.return_preheat_start)}` : ""}</span>
+          <button id="holiday-cancel" style="padding:3px 10px;border:1px solid var(--divider-color,#555);border-radius:6px;background:none;color:var(--primary-text-color);cursor:pointer;">Cancel</button>
+        </div>` : "";
+
+    const holidayTarget = zone?.holiday_target ?? {preset:"away", temperature:null};
+    const holidayIsPreset = holidayTarget.preset != null;
+    const holidayPresetOptions = VALID_PRESETS.map(p =>
+      `<option value="${p}"${holidayTarget.preset===p?" selected":""}>${PRESET_LABELS[p]||p}</option>`
+    ).join("");
+    const holidayValueControl = holidayIsPreset
+      ? `<select id="holiday-target-preset" style="padding:3px 5px;border-radius:5px;border:1px solid var(--divider-color,#555);background:var(--card-background-color,#1c1c1c);color:var(--primary-text-color);">${holidayPresetOptions}</select>`
+      : `<input id="holiday-target-temperature" type="number" value="${holidayTarget.temperature ?? 12}" min="5" max="30" step="0.5" style="width:58px;padding:3px 5px;border-radius:5px;border:1px solid var(--divider-color,#555);background:var(--card-background-color,#1c1c1c);color:var(--primary-text-color);">`;
+    const holidayControl = zone
+      ? `<div style="display:inline-flex;align-items:center;gap:5px;margin-right:auto;font-size:.8em;">
+          <span>Holiday mode:</span>${holidayValueControl}
+          <button id="holiday-target-toggle" title="Switch between preset and direct temperature" style="font-size:.9em;padding:2px 7px;border:1px solid var(--divider-color,#555);border-radius:10px;background:none;color:var(--primary-text-color);cursor:pointer;">→ ${holidayIsPreset ? "°C" : "Preset"}</button>
+        </div>` : "";
+
     this.innerHTML = zones.length === 0
       ? `<ha-card><div style="padding:24px;text-align:center;color:var(--secondary-text-color)">No zones configured. Add zones via the integration settings.</div></ha-card>
          <hestia-schedule-editor id="editor"></hestia-schedule-editor>`
       : `<ha-card>
           <div style="padding:12px 16px 0;font-size:1.1em;font-weight:600;">Heating Schedule</div>
+          ${holidayBanner}
           <div style="display:flex;gap:4px;padding:8px 16px 6px;overflow-x:auto;scrollbar-width:none;">${tabsHtml}</div>
           <div style="padding:2px 16px 0;">${axisRow}</div>
           <div id="week-grid" style="display:flex;flex-direction:column;gap:1px;padding:2px 16px 10px;position:relative;">
@@ -538,7 +604,7 @@ class HestiaScheduleCard extends HTMLElement {
               <div id="hover-label" style="position:absolute;top:2px;left:50%;transform:translateX(-50%);font-size:.6em;color:rgba(255,255,255,0.9);background:rgba(0,0,0,0.7);padding:1px 5px;border-radius:3px;white-space:nowrap;"></div>
             </div>
           </div>
-          <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:0 16px 12px;">${disabledLabel}${enableBtn}</div>
+          <div style="display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:0 16px 12px;flex-wrap:wrap;">${holidayControl}${disabledLabel}${enableBtn}</div>
         </ha-card>
         <hestia-schedule-editor id="editor"></hestia-schedule-editor>`;
 
@@ -550,6 +616,7 @@ class HestiaScheduleCard extends HTMLElement {
         el.day = el.dataset.day;
         el.isToday = el.dataset.today === "true";
         el.disabled = !zone.enabled;
+        el.holiday = zone.holiday;
         el.preheat = this._buildPreheatInfo(zone, el.dataset.day);
         if (el.dataset.today === "true") el.heatingOn = heating;
       });
@@ -689,6 +756,42 @@ class HestiaScheduleCard extends HTMLElement {
     });
 
     this._bindCardEvents();
+
+    const activeZone = (this._zones ?? []).find(z => z.zone_id === this._activeZoneId) ?? (this._zones ?? [])[0];
+    this.querySelector("#holiday-cancel")?.addEventListener("click", async () => {
+      try { await this._hass.callWS({ type: `${DOMAIN}/clear_holiday` }); }
+      catch (err) { console.error("Holiday cancel failed", err); }
+    });
+    this.querySelector("#holiday-target-preset")?.addEventListener("change", async e => {
+      if (!activeZone) return;
+      try {
+        await this._hass.callWS({
+          type: `${DOMAIN}/set_holiday_target`, zone_id: activeZone.zone_id, preset: e.target.value,
+        });
+      } catch (err) { console.error("Holiday target update failed", err); }
+    });
+    this.querySelector("#holiday-target-temperature")?.addEventListener("change", async e => {
+      if (!activeZone) return;
+      const temperature = Number(e.target.value);
+      if (!Number.isFinite(temperature)) return;
+      try {
+        await this._hass.callWS({
+          type: `${DOMAIN}/set_holiday_target`, zone_id: activeZone.zone_id, temperature,
+        });
+      } catch (err) { console.error("Holiday target update failed", err); }
+    });
+    this.querySelector("#holiday-target-toggle")?.addEventListener("click", async () => {
+      if (!activeZone) return;
+      const target = activeZone.holiday_target ?? {preset:"away"};
+      const request = target.preset != null
+        ? {temperature: PRESET_TEMP_APPROX[target.preset] ?? 12}
+        : {preset: "away"};
+      try {
+        await this._hass.callWS({
+          type: `${DOMAIN}/set_holiday_target`, zone_id: activeZone.zone_id, ...request,
+        });
+      } catch (err) { console.error("Holiday target update failed", err); }
+    });
 
     const weekGrid = this.querySelector('#week-grid');
     const cursor = this.querySelector('#hover-cursor');

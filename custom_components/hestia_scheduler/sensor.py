@@ -32,6 +32,7 @@ from .const import (
     EVENT_TRANSITION_EXECUTED,
     EVENT_ZONE_UPDATED,
     EVENT_PREHEAT_UPDATE,
+    EVENT_HOLIDAY_UPDATED,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ class HestiaZoneSensor(SensorEntity):
             EVENT_SCHEDULE_UPDATED,
             EVENT_TRANSITION_EXECUTED,
             EVENT_ZONE_UPDATED,
+            EVENT_HOLIDAY_UPDATED,
         ):
             self.async_on_remove(
                 async_dispatcher_connect(
@@ -129,7 +131,16 @@ class HestiaZoneSensor(SensorEntity):
 
         if not zone.enabled:
             self._attr_native_value = "disabled"
-            self._attr_extra_state_attributes = {"enabled": False}
+            holiday_state = (
+                engine.get_holiday_zone_state(self._zone_id)
+                if engine else {"active": False}
+            )
+            self._attr_extra_state_attributes = {
+                "enabled": False,
+                "holiday_active": holiday_state.get("active", False),
+                "holiday_until": holiday_state.get("until"),
+                "holiday_target": holiday_state.get("target"),
+            }
             return
 
         timer = engine.get_zone_timer(self._zone_id) if engine else None
@@ -144,6 +155,10 @@ class HestiaZoneSensor(SensorEntity):
             self._attr_native_value = "idle"
 
         attrs: dict = {"enabled": True, "preheating": preheating}
+        holiday_state = engine.get_holiday_zone_state(self._zone_id) if engine else {"active": False}
+        attrs["holiday_active"] = holiday_state.get("active", False)
+        attrs["holiday_until"] = holiday_state.get("until")
+        attrs["holiday_target"] = holiday_state.get("target")
         if next_s is not None:
             attrs["next_preset"] = next_s.preset
             attrs["next_temperature"] = next_s.temperature
@@ -191,6 +206,7 @@ class HestiaPreHeatSensor(SensorEntity):
             EVENT_TRANSITION_EXECUTED,
             EVENT_ZONE_UPDATED,
             EVENT_PREHEAT_UPDATE,
+            EVENT_HOLIDAY_UPDATED,
         ):
             self.async_on_remove(
                 async_dispatcher_connect(
@@ -291,8 +307,8 @@ class HestiaPreHeatSensor(SensorEntity):
         lead_minutes = None
         preheat_start = None
         if resolved_target is not None and current_temp is not None:
-            lead_minutes = thermal.estimate_lead_minutes(
-                self._zone_id, current_temp, resolved_target, outside_temp
+            lead_minutes = timer._calc_lead_minutes(
+                next_slot, holiday_return=timer.next_is_holiday_return
             )
             if next_dt is not None and lead_minutes > 0:
                 preheat_start = next_dt - timedelta(minutes=lead_minutes)

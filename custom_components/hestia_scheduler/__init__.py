@@ -23,6 +23,10 @@ from .const import (
     SERVICE_DISABLE_ZONE,
     SERVICE_SKIP_NEXT_TRANSITION,
     SERVICE_RENAME_ZONE,
+    SERVICE_SET_HOLIDAY,
+    SERVICE_CLEAR_HOLIDAY,
+    SERVICE_SET_ZONE_HOLIDAY_TARGET,
+    VALID_PRESETS,
     WEEKDAYS,
     EVENT_ZONE_UPDATED,
 )
@@ -97,6 +101,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return  # entry was unloaded / reloaded before HA finished starting
         await engine.async_start()
         await mqtt.async_publish_state()
+        await mqtt.async_publish_holiday_state()
         for zone in store.async_get_all_zones():
             async_dispatcher_send(hass, EVENT_ZONE_UPDATED, zone.zone_id)
 
@@ -237,6 +242,29 @@ def _async_register_services(hass: HomeAssistant) -> None:
     async def _svc_rename_zone(call) -> None:
         await _async_rename_zone(hass, call.data["zone_id"], call.data["new_zone_id"])
 
+    async def _svc_set_holiday(call) -> None:
+        engine: SchedulerEngine = hass.data[DOMAIN]["engine"]
+        payload = {
+            key: call.data[key]
+            for key in ("until", "until_text")
+            if key in call.data
+        }
+        if "until_text" in payload:
+            payload["text"] = payload.pop("until_text")
+        await engine.async_handle_holiday_request(payload, source="service")
+
+    async def _svc_clear_holiday(call) -> None:
+        engine: SchedulerEngine = hass.data[DOMAIN]["engine"]
+        await engine.async_clear_holiday()
+
+    async def _svc_set_zone_holiday_target(call) -> None:
+        coordinator = _get_coordinator()
+        coordinator.async_set_zone_holiday_target(
+            call.data["zone_id"],
+            preset=call.data.get("preset"),
+            temperature=call.data.get("temperature"),
+        )
+
     hass.services.async_register(
         DOMAIN, SERVICE_SET_ZONE_SCHEDULE, _svc_set_schedule,
         schema=vol.Schema({
@@ -263,6 +291,34 @@ def _async_register_services(hass: HomeAssistant) -> None:
             vol.Required("zone_id"): cv.string,
             vol.Required("new_zone_id"): cv.string,
         }),
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_HOLIDAY, _svc_set_holiday,
+        schema=vol.Schema(
+            vol.Any(
+                {vol.Required("until"): cv.string},
+                {vol.Required("until_text"): cv.string},
+            )
+        ),
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CLEAR_HOLIDAY, _svc_clear_holiday,
+        schema=vol.Schema({}),
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_ZONE_HOLIDAY_TARGET, _svc_set_zone_holiday_target,
+        schema=vol.Schema(
+            vol.Any(
+                {
+                    vol.Required("zone_id"): cv.string,
+                    vol.Required("preset"): vol.In(VALID_PRESETS),
+                },
+                {
+                    vol.Required("zone_id"): cv.string,
+                    vol.Required("temperature"): vol.Coerce(float),
+                },
+            )
+        ),
     )
     _LOGGER.debug("Hestia Scheduler services registered")
 
